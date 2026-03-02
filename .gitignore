@@ -28,6 +28,7 @@ data/
 # Local only
 tests/
 old-code/
+info/
 
 # Jupyter
 .ipynb_checkpoints/
