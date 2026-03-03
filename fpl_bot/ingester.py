@@ -59,7 +59,7 @@ valid_columns_opta = {
 
 opta_map = {
     # Unchanged
-    "minutes":                  "minutes",
+    "minutes_played":           "minutes",
 
     # Attack
     "goals":                    "goals_per_90",
@@ -117,16 +117,15 @@ opta_map = {
 class FPLSourceConfig:
     """
     Encodes distinct natures of data sets so all can be treated equally,
-    ensure all columns required for ouput are in map, even if unchanged
+    all output columns required must be in map (bar defaults), even if no transform,
+    any defaults will be added to map automatically
     """
-    col_map: dict[str, str]           # source_col → output columns ()
+    col_map: dict[str, str]           # source_col → output columns (should contain all columns even if no change)
     player_id: dict[str, str]         # maps player_id tag in dataset to "player_id"
     stacked: bool                     # one big file vs per-GW files
     gw_col: str | None                # which col has the GW number
     gw_path: str | None               # path pattern for per-GW files
-    defaults: dict[str, float]        # missing cols → default values
-    transforms: dict[str, Callable]   # post-rename column transforms, 
-                                      # ensure transform vectarised for efficiency
+    defaults: dict[str, float]        # missing cols → default values. NOTE: this stomps existing columns, intended feature
 
 class FPL_API_Provider:
     """
@@ -142,32 +141,34 @@ class FPL_API_Provider:
         self.season_root = season_root
         self.id_map = id_map
 
-        if self.config.stacked is True:
-            self._stacked_data = pd.csv_read(self.season_root + self.cfg.gw_path)
+        if self.cfg.stacked is True:
+            self._stacked_data = pd.read_csv(self.season_root + self.cfg.gw_path)
 
     def load_gameweek(
         self, 
         gw: int,
-    ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-        """
-        loads csv for a given gw
-        """
+    ) -> pd.DataFrame:
+
+        # load df, from mememory if stacked and from file if not
         if self.cfg.stacked is True:
             df = self._stacked_data[self._stacked_data[self.cfg.gw_col] == gw]
         else:
             df = pd.read_csv(self.season_root + self.cfg.gw_path + f"GW{gw}")
-        
+
+        # ensure that our output will contain any added defaults
+        output_cols = list(self.cfg.col_map.values()) + list(self.cfg.defaults.keys())    
+
+        # process df      
         df = (
             df
-            .rename(columns=self.cfg.player_id | self.cfg.col_map)                                          # renames columns
-            .merge(self.id_map, on="player_id", how="left")                                                 # currently maps, adding NO rows
-            .drop(columns="player_id")                                                                      #
-            .fillna(0)                                                                                      #                
-            .set_index("player_code")                                                                       #    
-            .assign(**{col: df.get(col, default) for col, default in self.cfg.defaults.items()})            # add default columns if missing
-            .assign(**{col: df[col].transform(func) for col, func in self.cfg.transforms.items()})          # apply any transforms
+            .rename(columns=self.cfg.player_id | self.cfg.col_map)  # renames columns
+            .assign(**self.cfg.defaults)                            # add default columns if missing
+            .merge(self.id_map, on="player_id", how="left")         # currently maps, adding NO rows    
+            .fillna(0)                                              # players missing from data, but in map, get 0s                 
+            .set_index("player_code")                               # set player_code as index
+            .filter(items=output_cols, axis=1)                      # select only output columns
         )
-        return df[self.cfg.req_features]
+        return df
 
         
 
@@ -178,11 +179,12 @@ class Ingester:
         id_map: pd.DataFrame,
         season_root: str,
         opta_cfg: FPLSourceConfig,
-        fpl_provider: FPL_API_Provider
+        fpl_provider: FPL_API_Provider,
     ):
         self.id_map = id_map
         self.season_root = season_root
         self.opta_cfg = opta_cfg
+        self.fpl_provider = fpl_provider
 
     """
     - loads one GW opta stats from FPL-Core-Insights repo,
@@ -190,15 +192,12 @@ class Ingester:
       we will internally accumulate stats and minutes, 
       this accumulative store will need to contain all players in id_map.
     - this source also includes europe, cup games and DGW, we isolate only EPL matches
-    - features with key = value in .col_map will not be per_90ed
     """
     def _load_pms_gameweek(
         self, 
-        cfg: FPLSourceConfig, 
         gw: int, 
-        id_map: pd.DataFrame,
         prev_cum: pd.DataFrame | None = None,
-        ) -> tuple(pd.DataFrame, pd.DataFrame):
+        ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         WARNING: If previous cummulative data exists, please input or tally reset.
         this is required defaults and transforms for cfg setup later
@@ -206,37 +205,37 @@ class Ingester:
             "_featured": 1,
         }
         """
-        self.opta_cfg.defaults["gw"] = gw
+        # add current game week to defaults and adds defaults to output columns
+        defaults = {**self.opta_cfg.defaults, "gw": gw}
+        output_cols = list(self.opta_cfg.col_map.values()) + list(defaults.keys())
+
+        # load df
         df = pd.read_csv(self.season_root + f"/GW{gw}/playermatchstats.csv")
 
-        # first we filter for epl games only, sum any dgw contributions, add defaults, rename columns and reindex to player_code
+        # process df
         df = (
             df
             .rename(columns=self.opta_cfg.player_id | self.opta_cfg.col_map)    # enforce naming convention
             .pipe(lambda d: d[["prem" in x for x in d["match_id"]]])            # extracts only EPL games         
-            .groupby("player_id").sum()                                         # sums incase of dgw
-            .assign(**self.opta_cfg.defaults)                                   # adds default values, i.e _featured = 1    
+            .groupby("player_id", as_index=False).sum(numeric_only=True)        # sums incase of dgw
+            .assign(**defaults)                                                 # adds defaults
             .merge(self.id_map, on="player_id", how="right")                    # add all players (including those who didnt play), 
             .fillna(0)                                                          # setting all stats 0 if they didn't feature
-            .drop("player_id", axis=1)                                          # player_id not season consistent, remove now 
             .set_index("player_code")                                           # index by player code
+            .filter(items=output_cols)                                          # select only output columns
         )
 
         # populate cumulative df if none exists, else add to existing df
         if prev_cum is None:
-            cum = df.filter(items=self.cum_feats)     
+            cum = df[self.opta_cfg.col_map.values()].copy()     
         else:
-            cum = prev_cum.add(df[self.cum_feats], fill_value = 0)
+            cum = prev_cum.add(df[self.opta_cfg.col_map.values()], fill_value = 0)
 
-        # per_90_ify all features that are not key = val and for rows of df where minutes != 0, this implies cum =! 0 by its definition
-        features_to_calc = {k: v for k, v in self.opta_cfg.col_map.items() if k != v}
+        # per_90_ify all features and for rows of df where minutes != 0, this implies cum =! 0 by its definition
+        per_90_features = [v for v in opta_map.values() if "per_90" in v]
         mask = df["minutes"] != 0
-        df.loc[mask, features_to_calc] = cum.loc[mask, features_to_calc].div(cum.loc[mask, "minutes"] / 90)
+        df.loc[mask, per_90_features] = cum.loc[mask, per_90_features].div(cum.loc[mask, "minutes"] / 90, axis=0)
 
+        # adds defaults
+                                                  
         return df, cum
-
-        
-
-
-
-
