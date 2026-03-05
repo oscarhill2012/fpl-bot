@@ -1,12 +1,7 @@
-import torch 
 import pandas as pd
 import numpy as np
 import logging
-from enum import Enum
 from dataclasses import dataclass
-from typing import Callable
-import math 
-from .features import Features, FeatureSpec, FeatureType
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -268,13 +263,14 @@ class Ingester:
     def __init__(
         self,
         season_root: str,
-        opta_provider: dfProvider,
-        fpl_provider: dfProvider,
+        fpl_config: FPLSourceConfig,
+        opta_config: FPLSourceConfig,
     ):
         self.season_root = season_root
-        self.fpl_provider = fpl_provider
-        self.opta_provider = opta_provider
+        self.fpl_provider = dfProvider(fpl_config, season_root)
+        self.opta_provider = dfProvider(opta_config, season_root)
         self.output_dict = {}
+        self.cumulative_dict = {}
 
     """
     Private Functions
@@ -311,13 +307,12 @@ class Ingester:
 
         # load opta and fpl api stats
         for gw in range(gameweek_start, gameweek_end+1):
-            opta_gw = self.opta_provider.load_gameweek(gw)
-            fpl_gw = self.fpl_provider.load_gameweek(gw)
-
-            gw_combined = self._merge_dfs(fpl_gw, opta_gw)
+            gw_combined = self._merge_dfs(self.fpl_provider.load_gameweek(gw), self.opta_provider.load_gameweek(gw))
+            gw_cum_combined = self._merge_dfs(self.opta_provider._cum, self.fpl_provider)
             self.output_dict[gw] = gw_combined
+            self.cumulative_dict[gw] = gw_cum_combined
 
-        return self.output_dict
+        return self.output_dict, self.cumulative_dict
 
     def append_gw(self, gw: int) -> dict[str, pd.DataFrame]:
         """
@@ -326,10 +321,9 @@ class Ingester:
                  please explicitly call reset() if required.
         """
         # load opta and fpl api stats
-        opta_gw = self.opta_provider.load_gameweek(gw)
-        fpl_gw = self.fpl_provider.load_gameweek(gw)
-
-        gw_combined = self._merge_dfs(fpl_gw, opta_gw)
+        gw_combined = self._merge_dfs(self.fpl_provider.load_gameweek(gw), self.opta_provider.load_gameweek(gw))
+        gw_cum_combined = self._merge_dfs(self.opta_provider._cum, self.fpl_provider)
         self.output_dict[gw] = gw_combined
+        self.cumulative_dict[gw] = gw_cum_combined
 
-        return self.output_dict
+        return self.output_dict, self.cumulative_dict
