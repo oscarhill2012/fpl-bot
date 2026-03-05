@@ -62,11 +62,7 @@ opta_map = {
     "minutes_played":           "minutes",
 
     # Attack
-    "goals":                    "goals_per_90",
-    "assists":                  "assists_per_90",
     "total_shots":              "shots_per_90",
-    "xg":                       "xg_per_90",
-    "xa":                       "xa_per_90",
     "xgot":                     "xgot_per_90",
     "shots_on_target":          "shots_on_target_per_90",
     "big_chances_missed":       "big_chances_missed_per_90",
@@ -103,8 +99,6 @@ opta_map = {
     "fouls_committed":          "fouls_committed_per_90",
 
     # GK
-    "saves":                    "saves_per_90",
-    "goals_conceded":           "goals_conceded_per_90",
     "xgot_faced":               "xgot_faced_per_90",
     "goals_prevented":          "goals_prevented_per_90",
     "sweeper_actions":          "sweeper_actions_per_90",
@@ -112,6 +106,55 @@ opta_map = {
     "gk_accurate_passes":       "gk_accurate_passes_per_90",
     "gk_accurate_long_balls":   "gk_accurate_long_balls_per_90",
 }
+
+vaastav_map = {
+    "minutes":                      "minutes",
+    "starts":                       "starts",
+    "total_points":                 "total_points",
+    "transfers_in":                 "transfers_in",
+    "transfers_out":                "transfers_out",
+    "goals_scored":                 "goals_per_90",
+    "assists":                      "assists_per_90",
+    "clean_sheets":                 "clean_sheets_per_90",
+    "goals_conceded":               "goals_conceded_per_90",
+    "yellow_cards":                 "yellow_cards_per_90",
+    "saves":                        "saves_per_90",
+    "bonus":                        "bonus_per_90",
+    "bps":                          "bps_per_90",
+    "influence":                    "influence_per_90",
+    "creativity":                   "creativity_per_90",
+    "threat":                       "threat_per_90",
+    "ict_index":                    "ict_index_per_90",
+    "expected_goals":               "expected_goals_per_90",
+    "expected_assists":             "expected_assists_per_90",
+    "expected_goal_involvements":   "expected_goal_involvements_per_90",
+    "expected_goals_conceded":      "expected_goals_conceded_per_90",
+}
+
+fci_map = {
+    "minutes":                      "minutes",
+    "starts":                       "starts",
+    "total_points":                 "total_points",
+    "transfers_in":                 "transfers_in",
+    "transfers_out":                "transfers_out",
+    "goals_scored":                 "goals_per_90",
+    "assists":                      "assists_per_90",
+    "clean_sheets":                 "clean_sheets_per_90",
+    "goals_conceded":               "goals_conceded_per_90",
+    "yellow_cards":                 "yellow_cards_per_90",
+    "saves":                        "saves_per_90",
+    "bonus":                        "bonus_per_90",
+    "bps":                          "bps_per_90",
+    "influence":                    "influence_per_90",
+    "creativity":                   "creativity_per_90",
+    "threat":                       "threat_per_90",
+    "ict_index":                    "ict_index_per_90",
+    "expected_goals":               "expected_goals_per_90",
+    "expected_assists":             "expected_assists_per_90",
+    "expected_goal_involvements":   "expected_goal_involvements_per_90",
+    "expected_goals_conceded":      "expected_goals_conceded_per_90",
+}
+
 
 @dataclass
 class FPLSourceConfig:
@@ -122,120 +165,171 @@ class FPLSourceConfig:
     """
     col_map: dict[str, str]           # source_col → output columns (should contain all columns even if no change)
     player_id: dict[str, str]         # maps player_id tag in dataset to "player_id"
+    id_map: pd.DataFrame              # dataframe that contains id inrelation to player code
     stacked: bool                     # one big file vs per-GW files
+    denotes_epl: dict[str, str]       # verifies data from epl match: {indentifying feature: identifying string}
+    other_games: bool                 # if dataset contains non-EPL matches, is True
     gw_col: str | None                # which col has the GW number
     gw_path: str | None               # path pattern for per-GW files
     defaults: dict[str, float]        # missing cols → default values. NOTE: this stomps existing columns, intended feature
 
-class FPL_API_Provider:
+
+class dfProvider:
     """
     loads per-GW FPL API stats from any source.
+    Cummulative totals are stored as internal state, 
+    please use reset() to clean
     """
     def __init__(
         self, 
         config: FPLSourceConfig,
         season_root: str,
-        id_map: pd.DataFrame,
     ):
         self.cfg = config
         self.season_root = season_root
-        self.id_map = id_map
+        self._cum = None
 
         if self.cfg.stacked is True:
             self._stacked_data = pd.read_csv(self.season_root + self.cfg.gw_path)
 
+    def reset(self):
+        self._cum = None
+        return self
+
     def load_gameweek(
         self, 
-        gw: int,
-    ) -> pd.DataFrame:
-
-        # load df, from mememory if stacked and from file if not
+        gw: int, 
+        ) -> pd.DataFrame:
+        """
+        - loads a gameweek, from stacked or from file
+        - processes
+        - calculates any per_90 feature if config sets output to contain "per_90"
+        - stores cumulative tally privately and outputs df
+        """
+        # load df
         if self.cfg.stacked is True:
             df = self._stacked_data[self._stacked_data[self.cfg.gw_col] == gw]
-        else:
-            df = pd.read_csv(self.season_root + self.cfg.gw_path + f"GW{gw}")
-
-        # ensure that our output will contain any added defaults
-        output_cols = list(self.cfg.col_map.values()) + list(self.cfg.defaults.keys())    
-
-        # process df      
-        df = (
-            df
-            .rename(columns=self.cfg.player_id | self.cfg.col_map)  # renames columns
-            .assign(**self.cfg.defaults)                            # add default columns if missing
-            .merge(self.id_map, on="player_id", how="left")         # currently maps, adding NO rows    
-            .fillna(0)                                              # players missing from data, but in map, get 0s                 
-            .set_index("player_code")                               # set player_code as index
-            .filter(items=output_cols, axis=1)                      # select only output columns
-        )
-        return df
-
+        else:    
+            df = pd.read_csv(self.season_root + f"/GW{gw}/playermatchstats.csv")
         
+        # checks all features of col_map are in dataset
+        missing = set(self.cfg.col_map.keys()) - set(df.columns)
+        if missing:
+            logger.warning(f"GW{gw}: missing source columns: {missing}")
 
-class Ingester:
+        # if df contains none epl matches, remove them
+        if self.cfg.other_games is True:
+            col, pattern = next(iter(self.cfg.denotes_epl.items()))
+            df = df[df[col].str.contains(pattern)]
 
-    def __init__(
-        self,
-        id_map: pd.DataFrame,
-        season_root: str,
-        opta_cfg: FPLSourceConfig,
-        fpl_provider: FPL_API_Provider,
-    ):
-        self.id_map = id_map
-        self.season_root = season_root
-        self.opta_cfg = opta_cfg
-        self.fpl_provider = fpl_provider
+        # checks if data set empty
+        if df.empty:
+            logger.warning(f"GW{gw}: no data left after filtering for EPL")
 
-    """
-    - loads one GW opta stats from FPL-Core-Insights repo,
-    - since per_90 stats ae (cumulative_stat / cumulative_minutes) * 90,
-      we will internally accumulate stats and minutes, 
-      this accumulative store will need to contain all players in id_map.
-    - this source also includes europe, cup games and DGW, we isolate only EPL matches
-    """
-    def _load_pms_gameweek(
-        self, 
-        gw: int, 
-        prev_cum: pd.DataFrame | None = None,
-        ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        WARNING: If previous cummulative data exists, please input or tally reset.
-        this is required defaults and transforms for cfg setup later
-        defaults {
-            "_featured": 1,
-        }
-        """
-        # add current game week to defaults and adds defaults to output columns
-        defaults = {**self.opta_cfg.defaults, "gw": gw}
-        output_cols = list(self.opta_cfg.col_map.values()) + list(defaults.keys())
-
-        # load df
-        df = pd.read_csv(self.season_root + f"/GW{gw}/playermatchstats.csv")
+        # load output columns to list
+        output_cols = list(self.cfg.col_map.values())
 
         # process df
         df = (
             df
-            .rename(columns=self.opta_cfg.player_id | self.opta_cfg.col_map)    # enforce naming convention
-            .pipe(lambda d: d[["prem" in x for x in d["match_id"]]])            # extracts only EPL games         
+            .rename(columns=self.cfg.player_id | self.cfg.col_map)              # enforce naming convention         
             .groupby("player_id", as_index=False).sum(numeric_only=True)        # sums incase of dgw
-            .assign(**defaults)                                                 # adds defaults
-            .merge(self.id_map, on="player_id", how="right")                    # add all players (including those who didnt play), 
+            .merge(self.cfg.id_map, on="player_id", how="right")                # add all players (including those who didnt play),
             .fillna(0)                                                          # setting all stats 0 if they didn't feature
             .set_index("player_code")                                           # index by player code
             .filter(items=output_cols)                                          # select only output columns
         )
 
+        # snapshot previous points
+        prev_points = self._cum["total_points"].copy() if self._cum is not None else 0 
+
         # populate cumulative df if none exists, else add to existing df
-        if prev_cum is None:
-            cum = df[self.opta_cfg.col_map.values()].copy()     
+        if self._cum is None:
+            self._cum = df[output_cols].copy()  
         else:
-            cum = prev_cum.add(df[self.opta_cfg.col_map.values()], fill_value = 0)
+            self._cum = self._cum.add(df[output_cols], fill_value = 0)
 
-        # per_90_ify all features and for rows of df where minutes != 0, this implies cum =! 0 by its definition
-        per_90_features = [v for v in opta_map.values() if "per_90" in v]
+        # if dataset contains points, it needs to be differenced (we want points from given game)
+        if "total_points" in df.columns:
+            df["points"] = self._cum["total_points"] - prev_points
+            df = df.drop("total_points", axis=1)
+        # NOTE: this means that output columns are now not cfg.col_map.values(), total points -> points
+
+        # per_90_ify and for rows of df where minutes != 0, this implies cum =! 0 by definition
+        per_90_features = [v for v in output_cols if "per_90" in v]
         mask = df["minutes"] != 0
-        df.loc[mask, per_90_features] = cum.loc[mask, per_90_features].div(cum.loc[mask, "minutes"] / 90, axis=0)
+        df.loc[mask, per_90_features] = self._cum.loc[mask, per_90_features].div(self._cum.loc[mask, "minutes"] / 90, axis=0)
+      
+        return df
 
-        # adds defaults
-                                                  
-        return df, cum
+        
+class Ingester:
+
+    def __init__(
+        self,
+        season_root: str,
+        opta_provider: dfProvider,
+        fpl_provider: dfProvider,
+    ):
+        self.season_root = season_root
+        self.fpl_provider = fpl_provider
+        self.opta_provider = opta_provider
+        self.output_dict = {}
+
+    """
+    Private Functions
+    """
+
+    def _merge_dfs(self, fpl: pd.DataFrame, opta: pd.DataFrame) -> pd.DataFrame:
+        # any final processing for fpl and opta datasets
+        fpl = (
+            fpl
+        )
+
+        opta = (
+            opta.drop(columns="minutes", errors="ignore")
+        )
+
+        return pd.concat([fpl, opta], axis=1)
+
+    """
+    Public Functions
+    """
+    def reset(self):
+        logger.info("FPL and Opta cumulative tallies have been reset.")
+        self.fpl_provider.reset()
+        self.opta_provider.reset()
+        return self       
+
+    def ingest(self, gameweek_start: int, gameweek_end: int) -> dict[str, pd.DataFrame]:
+        """
+        Ingests bulk data from a gameweek range
+        """
+        # resets providers
+        self.fpl_provider.reset()
+        self.opta_provider.reset()
+
+        # load opta and fpl api stats
+        for gw in range(gameweek_start, gameweek_end+1):
+            opta_gw = self.opta_provider.load_gameweek(gw)
+            fpl_gw = self.fpl_provider.load_gameweek(gw)
+
+            gw_combined = self._merge_dfs(fpl_gw, opta_gw)
+            self.output_dict[gw] = gw_combined
+
+        return self.output_dict
+
+    def append_gw(self, gw: int) -> dict[str, pd.DataFrame]:
+        """
+        Ingests a given gameweek
+        WARNING: for functionality append_gw() never resets cummulative data,
+                 please explicitly call reset() if required.
+        """
+        # load opta and fpl api stats
+        opta_gw = self.opta_provider.load_gameweek(gw)
+        fpl_gw = self.fpl_provider.load_gameweek(gw)
+
+        gw_combined = self._merge_dfs(fpl_gw, opta_gw)
+        self.output_dict[gw] = gw_combined
+
+        return self.output_dict
