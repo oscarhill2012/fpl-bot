@@ -72,24 +72,33 @@ class Features:
     '''
 
     def _validate(self):
+        # validate input
+        # ensure no duplicates
         names = [s.name for s in self.specs]
         if len(names) != len(set(names)):
             raise ValueError("Duplicate feature names detected.")
 
         for s in self.specs:
+            # periodic features require given period
             if s.feature_type == FeatureType.PERIODIC:
                 if s.period is None:
                     raise ValueError(f"{s.name} requires period.")
+
             if s.feature_type == FeatureType.BOUNDED:
+                # bound features require max, else if max not in data cannot calculate
                 if s.max_value is None:
                     raise ValueError(f"{s.name} requires a max_value.")
+                # finite max_value
                 if not math.isfinite(s.max_value):
                     raise ValueError(f"max_value must be finite, received {s.max_value}.")
+                # max_value must be non-zero
                 if abs(s.max_value) < self.eps:
                     raise ValueError(f"max_value must be non-zero (abs < eps={self.eps}), received {s.max_value}.")
+            # catergorical feature requires catergories
             if s.feature_type == FeatureType.CATEGORICAL:
                 if s.categories is None:
                     raise ValueError(f"{s.name} requires catergories")
+            # a feature that implies data was present (i.e 0 means bad performance not missing) requires threshold
             if s.presence_check == True:
                 if s.min_value is None:
                     raise ValueError(f"{s.name} requires min_value to be presence check")
@@ -111,9 +120,11 @@ class Features:
     '''
 
     def _temporal_mask(self):
+        # build mask for temporal features, none temporal is inverse
         return torch.tensor([s.temporal for s in self.specs])
 
     def _build_mode_masks(self):
+        # build masks for different scaling modes
         masks = {}
         for ftype in ScalingMode:
             masks[ftype] = torch.tensor(
@@ -123,6 +134,7 @@ class Features:
         return masks
 
     def _build_type_mask(self):
+        # build mask by type of feature
         masks = {}
         for ftype in FeatureType:
             masks[ftype] = torch.tensor(
@@ -136,6 +148,7 @@ class Features:
     '''
 
     def __len__(self):
+        # return number of features
         return len(self.specs)  
 
     '''
@@ -143,6 +156,7 @@ class Features:
     '''
 
     def to_dict(self):
+        # store features to dict
         return [
             {
                 "name": s.name,
@@ -163,6 +177,7 @@ class Features:
 
     @classmethod
     def from_dict(cls, data):
+        # load features from dict
         specs = []
         for d in data:
             specs.append(

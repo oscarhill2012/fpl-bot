@@ -44,6 +44,7 @@ class _LinearScaler:
 
     @property
     def get_params(self) -> [torch.Tensor, torch.Tensor]:
+        # return scaling parameters to user upon request
         if not self._fitted:
             raise RuntimeError('Must call fit() before get_params()')
 
@@ -56,63 +57,87 @@ class _LinearScaler:
     '''
 
     def fit(self, x: torch.Tensor) -> '_LinearScaler':
+        # clone to avoid mutation and send to device 
         x = x.clone().to(self.device)
+        # send through hook, so for inherited classes can apply transform before linear fit
         x_sel = self._transform_input(x)
 
+        # calculate location and mean, ouput as [1, n_scaled_features]
         self.location = x_sel.mean(dim=0, keepdim=True)
         self.scale = x_sel.std(dim=0, keepdim=True, correction=0).clamp(min=self.eps)
 
+        # return state, fitted allows transform, inverse and get params
         self._fitted = True
         return self
 
     def fit_transform_from_params(self, x: torch.Tensor, params: torch.Tensor):
+        # validate input
+        # params must be shape [1, n_scaled_features]
         if not x.shape[-1] == params.shape[-1]:
             raise ValueError('Params and Data must both be same n_features')
+        # make user aware they overwritting a scaler
         if self._fitted:
             warnings.warn('You have overwritten scaler params')
+        # NAN input will corrupt data
         if torch.isnan(x).any().item():
             raise RuntimeError('Scaling parameters contains NAN')
 
+        # ensure params are on device
         self.location = params[0, :].to(self.device)
         self.scale = params[1, :].to(self.device)
-        self._fitted = True
 
+        # set fitted state and transform input with given params, ouput is [n_samples, n_scaled_features]
+        self._fitted = True
         return self.transform(x)
 
     def fit_inverse_from_params(self, x: torch.Tensor, params: torch.Tensor):
-
+        # validate input
+        # params are required to be shape [1, n_features]
         if not x.shape[-1] == params.shape[-1]:
             raise ValueError('Params and Data must both be same n_features')
+        # make user aware they overwritting a scaler
         if self._fitted:
             warnings.warn('You have overwritten scaler params')
-        if torch.isnan(x).any().item():
+        # NAN input will corrupt data
+        if torch.isnan(params).any().item():
             raise RuntimeError('Scaling parameters contains NAN')
 
+        # ensure params are on device        
         self.location = params[0, :].to(self.device)
         self.scale = params[1, :].to(self.device)
-        self._fitted = True
 
+        # set fitted state and transform input with given params, ouput is [n_samples, n_scaled_features]
+        self._fitted = True
         return self.inverse_transform(x)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
+        # cannot transform if no parameters
         if not self._fitted:
             raise RuntimeError("Must call fit() before transform().")
 
+        # clone to avoid mutation and set to deivice
         x = x.clone().to(self.device)        
+        # send through transform to allow transform before linear scale
         x = self._transform_input(x)
 
+        # transform tensor, ouput is [n_samples, n_scaled_features]
         return (x - self.location) / self.scale
 
     def fit_transform(self, x: torch.Tensor) -> torch.Tensor:
         return self.fit(x).transform(x)
 
     def inverse_transform(self, x: torch.Tensor) -> torch.Tensor:
+        # cannot inverse with no parameters
         if not self._fitted:
             raise RuntimeError("Must call fit() before inverse_transform().")
 
-        x = x.clone().to(self.device) 
+        # clone to avoid mutation and set to deivice
+        x = x.clone().to(self.device)
+
+        # inverse transform 
         x = ((x * self.scale) + self.location)
 
+        #return through hook, note hook second as transform and hook dont commute, ouput is [n_samples, n_scaled_features]
         return self._inverse_transform_input(x)
 
 
@@ -124,6 +149,7 @@ class _LogScaler(_LinearScaler):
         max_value: torch.Tensor | None = None,  # unused, for interface consistency
         min_value: torch.Tensor | None = None,  # unused, for interface consistency
     ):
+        # inherit from linear scaler
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
 
 
@@ -132,6 +158,7 @@ class _LogScaler(_LinearScaler):
     '''
 
     def _validate(self, x: torch.Tensor):
+        # ensures no values below -1 so log doesnt produce NAN
         if (x < -1).any().item():
             raise ValueError('Feature to be Log scaled contains value < -1')
 
@@ -140,10 +167,13 @@ class _LogScaler(_LinearScaler):
     '''
 
     def _transform_input(self, x: torch.Tensor) -> torch.Tensor:
+        # validate 
         self._validate(x)
+        # log (1 + x)
         return torch.log1p(x)
 
     def _inverse_transform_input(self, x: torch.Tensor) -> torch.Tensor:
+        # e^(1+x)
         return torch.expm1(x)
 
 
@@ -156,6 +186,7 @@ class _RobustScaler(_LinearScaler):
         max_value: torch.Tensor | None = None,   # unused, for interface consistency
         min_value: torch.Tensor | None = None,   # unused, for interface consistency
     ):
+        # inherit from linear scaler
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
 
     '''
@@ -163,14 +194,18 @@ class _RobustScaler(_LinearScaler):
     '''
 
     def fit(self, x: torch.Tensor) -> '_RobustScaler':
-        x = x.clone().to(self.device)
+        # clone to avoid mutation and set to deivice
+        x = x.clone().to(self.device)        
+        # send through transform to allow transform before linear scale
         x_sel = self._transform_input(x)
 
+        # find median and iqr, both shape [1, n_scaled_features]
         self.location = x_sel.median(dim=0, keepdim=True).values
         q1 = torch.quantile(x_sel, 0.25, dim=0, keepdim=True)
         q3 = torch.quantile(x_sel, 0.75, dim=0, keepdim=True)
         self.scale = (q3 - q1).clamp(min=self.eps)
 
+        # set fitted state and return
         self._fitted = True
         return self
 
@@ -184,6 +219,7 @@ class _RobustLog(_RobustScaler):
         max_value: torch.Tensor | None = None,   # unused, for interface consistency
         min_value: torch.Tensor | None = None,   # unused, for interface consistency
     ):
+        # inherit from linear scaler
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
 
     '''
@@ -191,6 +227,7 @@ class _RobustLog(_RobustScaler):
     '''
 
     def _validate(self, x: torch.Tensor):
+        # ensure no values below -1 so log doesnt NAN
         if (x < -1).any().item():
             raise ValueError('Feature to be Log-Robust scaled contains value < -1')
 
@@ -199,10 +236,13 @@ class _RobustLog(_RobustScaler):
     '''
 
     def _transform_input(self, x: torch.Tensor) -> torch.Tensor:
+        # validate
         self._validate(x)
+        # log(1+x)
         return torch.log1p(x)
 
     def _inverse_transform_input(self, x: torch.Tensor) -> torch.Tensor:
+        # e^(1+x)
         return torch.expm1(x)
 
 
@@ -215,8 +255,11 @@ class _BoundedScaler(_LinearScaler):
         max_value: torch.Tensor | None = None,   # unused, for interface consistency
         min_value: torch.Tensor | None = None,   # unused, for interface consistency
     ):
+        # inherit from lienar scaler
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
+        # since bounded we now need max and min values as scaling params
         self.max_value = max_value.to(self.device)
+        # min generally 0 but can be set to non-zero if required
         self.min_value = (
             min_value.to(self.device)
             if min_value is not None 
@@ -231,6 +274,8 @@ class _BoundedScaler(_LinearScaler):
 
     @property
     def get_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        # cannot call params without fitting, user inputs min and max so redundant in that sense
+        # but required for interface consistency when storing params for all scalers
         if not self._fitted:
             raise RuntimeError('Must call fit() before get_params()')
 
@@ -243,40 +288,57 @@ class _BoundedScaler(_LinearScaler):
     '''
 
     def fit(self, x: torch.Tensor) -> '_BoundedScaler':
+        # user inputs scaling params so this function is redundant
+        # make explicitly do nothing as inherits linear scaler fit() else
         return self
 
-    def transform(self, x: torch.Tensor):
-        x = x.clone().to(self.device) 
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        # clone to avoid mutation and set to deivice
+        x = x.clone().to(self.device)        
+        # send through transform to allow transform before linear scale
         x_sel = self._transform_input(x)
 
+        # return transformed tensor, ouput is [n_samples, n_scaled_features]
         return (x_sel - self.min_value) / (self.max_value - self.min_value)
 
-    def fit_transform_from_params(self, x: torch.Tensor, params: torch.Tensor):
+    def fit_transform_from_params(self, x: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        # validate
+        # params must be shape [1, n_scaled_features]
         if not x.shape[-1] == params.shape[-1]:
             raise ValueError('Params and Data must both be same n_features')
-        if torch.isnan(x).any().item():
+        # ensure scaling params are NAN
+        if torch.isnan(params).any().item():
             raise RuntimeError('Scaling parameters contain NAN')
 
+        # ensure params are on device
         self.min_value = params[0, :].to(self.device)
         self.max_value = params[1, :].to(self.device)
 
+        # returns transform tensor, ouput is [n_samples, n_scaled_features]
         return self.transform(x)
 
-    def fit_inverse_from_params(self, x: torch.Tensor, params: torch.Tensor):
+    def fit_inverse_from_params(self, x: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        # validate
+        # params must be shape [1, n_scaled_features]
         if not x.shape[-1] == params.shape[-1]:
             raise ValueError('Params and Data must both be same n_features')
         if torch.isnan(x).any().item():
             raise RuntimeError('Scaling parameters contains NAN')
 
+        # ensure params are on device
         self.min_value = params[0, :].to(self.device)
         self.max_value = params[1, :].to(self.device)
 
+        # return inverse tensor, ouput is [n_samples, n_scaled_features]
         return self.inverse_transform(x)
     
     def inverse_transform(self, x: torch.Tensor) -> torch.Tensor:
+        # clone to avoid mutation and set to device
         x = x.clone().to(self.device) 
+        # inverse scale
         x = (x * (self.max_value - self.min_value)) + self.min_value
 
+        # return through hook, ouput is [n_samples, n_scaled_features]
         return self._inverse_transform_input(x)
 
 

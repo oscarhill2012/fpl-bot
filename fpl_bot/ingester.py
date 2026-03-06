@@ -105,6 +105,7 @@ opta_map = {
 vaastav_map = {
     "minutes":                      "minutes",
     "starts":                       "starts",
+    "value":                        "price",
     "total_points":                 "total_points",
     "transfers_in":                 "transfers_in",
     "transfers_out":                "transfers_out",
@@ -129,7 +130,8 @@ vaastav_map = {
 fci_map = {
     "minutes":                      "minutes",
     "starts":                       "starts",
-    "total_points":                 "total_points",
+    "now_cost":                     "price",
+    "total_points":                 "points",
     "transfers_in":                 "transfers_in",
     "transfers_out":                "transfers_out",
     "goals_scored":                 "goals_per_90",
@@ -150,7 +152,9 @@ fci_map = {
     "expected_goals_conceded":      "expected_goals_conceded_per_90",
 }
 
-
+vaastav_transform = {
+    "price": lambda x: x/10,
+}
 @dataclass
 class FPLSourceConfig:
     """
@@ -166,7 +170,7 @@ class FPLSourceConfig:
     other_games: bool                 # if dataset contains non-EPL matches, is True
     gw_col: str | None                # which col has the GW number
     gw_path: str | None               # path pattern for per-GW files
-    defaults: dict[str, float]        # missing cols → default values. NOTE: this stomps existing columns, intended feature
+    transform: dict[str, callable]    # transform feature
 
 
 class dfProvider:
@@ -183,10 +187,16 @@ class dfProvider:
         self.cfg = config
         self.season_root = season_root
         self._cum = None
+        self._cum_map = {}
 
+        # check if stacked df, one initial load saves time
         if self.cfg.stacked is True:
             self._stacked_data = pd.read_csv(self.season_root + self.cfg.gw_path)
 
+        # generate columns of cumulative data 
+        for cols in self.cfg.col_map.values():
+            self._cum_map[cols] = "cum_" + cols.replace("_per_90", "")
+    
     def reset(self):
         self._cum = None
         return self
@@ -227,39 +237,49 @@ class dfProvider:
         # process df
         df = (
             df
-            .rename(columns=self.cfg.player_id | self.cfg.col_map)              # enforce naming convention         
-            .groupby("player_id", as_index=False).sum(numeric_only=True)        # sums incase of dgw
-            .merge(self.cfg.id_map, on="player_id", how="right")                # add all players (including those who didnt play),
-            .fillna(0)                                                          # setting all stats 0 if they didn't feature
-            .set_index("player_code")                                           # index by player code
-            .filter(items=output_cols)                                          # select only output columns
+            .rename(columns=self.cfg.player_id | self.cfg.col_map)                      # enforce naming convention         
+            .groupby("player_id", as_index=False).sum(numeric_only=True)                # sums incase of dgw
+            .merge(self.cfg.id_map, on="player_id", how="right")                        # add all players (including those who didnt play),
+            .fillna(0)                                                                  # setting all stats 0 if they didn't feature
+            .set_index("player_code")                                                   # index by player code
+            .filter(items=output_cols)                                                  # select only output columns
+            .apply(**{col: func(df[col]) for col, func in self.cfg.transform.items()})  # apply transforms
         )
 
         # snapshot previous points
-        prev_points = self._cum["total_points"].copy() if self._cum is not None else 0 
+        prev_points = self._cum["cum_points"].copy() if self._cum is not None else 0 
 
         # populate cumulative df if none exists, else add to existing df
         if self._cum is None:
-            self._cum = df[output_cols].copy()  
+            self._cum = df[output_cols].rename(columns=self._cum_map).copy()
         else:
-            self._cum = self._cum.add(df[output_cols], fill_value = 0)
+            self._cum = self._cum.add(df[output_cols].rename(columns=self._cum_map), fill_value = 0)
 
         # if dataset contains points, it needs to be differenced (we want points from given game)
-        if "total_points" in df.columns:
-            df["points"] = self._cum["total_points"] - prev_points
-            df = df.drop("total_points", axis=1)
-        # NOTE: this means that output columns are now not cfg.col_map.values(), total points -> points
+        if "points" in df.columns:
+            df["points"] = self._cum["cum_points"] - prev_points
+            df = df.drop("points", axis=1)
+
 
         # per_90_ify and for rows of df where minutes != 0, this implies cum =! 0 by definition
         per_90_features = [v for v in output_cols if "per_90" in v]
         mask = df["minutes"] != 0
-        df.loc[mask, per_90_features] = self._cum.loc[mask, per_90_features].div(self._cum.loc[mask, "minutes"] / 90, axis=0)
+        df.loc[mask, per_90_features] = self._cum.loc[mask, per_90_features].div(self._cum.loc[mask, "cum_minutes"] / 90, axis=0)
       
         return df
 
         
 class Ingester:
-
+    """
+    Ingests data from a source depending on the provided config,
+    Outputs both snapshot and cumulative data, output stored in dict.
+    Convention; ingester only to be used for one season at a time,
+                output dict is {int, DataFrame},
+                with int is season start year and gw, i.e 2438 (24/25 season, gw 38)
+    WARNING: both opta and fpl_api contain minutes that slightly differ,
+             here we use opta minutes for opta per 90 and hope it makes no difference!
+             - when tested differences were at most 5% over season so should be fine
+    """
     def __init__(
         self,
         season_root: str,
@@ -281,16 +301,15 @@ class Ingester:
         fpl = (
             fpl
         )
-
         opta = (
-            opta.drop(columns="minutes", errors="ignore")
+            opta
         )
-
         return pd.concat([fpl, opta], axis=1)
 
     """
     Public Functions
     """
+
     def reset(self):
         logger.info("FPL and Opta cumulative tallies have been reset.")
         self.fpl_provider.reset()
@@ -301,14 +320,22 @@ class Ingester:
         """
         Ingests bulk data from a gameweek range
         """
-        # resets providers
-        self.fpl_provider.reset()
-        self.opta_provider.reset()
+        # warn user if running ingest() without reset
+        if not self.cumulative_dict:
+            logger.warning("Cumulative tally has not been reset, proceed with caution.")
 
         # load opta and fpl api stats
         for gw in range(gameweek_start, gameweek_end+1):
-            gw_combined = self._merge_dfs(self.fpl_provider.load_gameweek(gw), self.opta_provider.load_gameweek(gw))
-            gw_cum_combined = self._merge_dfs(self.opta_provider._cum, self.fpl_provider)
+            # drop minutes from opta data
+            gw_combined = self._merge_dfs(
+                self.fpl_provider.load_gameweek(gw), 
+                self.opta_provider.load_gameweek(gw).drop(columns="minutes", errors="ignore"),
+            )
+            # drop cumulative points as this was only used for differencing to get points
+            gw_cum_combined = self._merge_dfs(
+                self.fpl_provider._cum.drop(columns="cum_minutes", errors="ignore"), 
+                self.opta_provider._cum.drop(columns="cum_minutes", errors="ignore"),
+            )
             self.output_dict[gw] = gw_combined
             self.cumulative_dict[gw] = gw_cum_combined
 
@@ -321,8 +348,16 @@ class Ingester:
                  please explicitly call reset() if required.
         """
         # load opta and fpl api stats
-        gw_combined = self._merge_dfs(self.fpl_provider.load_gameweek(gw), self.opta_provider.load_gameweek(gw))
-        gw_cum_combined = self._merge_dfs(self.opta_provider._cum, self.fpl_provider)
+        # drop minutes from opta data
+        gw_combined = self._merge_dfs(
+            self.fpl_provider.load_gameweek(gw), 
+            self.opta_provider.load_gameweek(gw).drop(columns="minutes", errors="ignore"),
+        )
+        # drop cumulative points as this was only used for differencing to get points
+        gw_cum_combined = self._merge_dfs(
+            self.fpl_provider._cum.drop(columns="cum_minutes", errors="ignore"), 
+            self.opta_provider._cum.drop(columns="cum_minutes", errors="ignore"),
+        )
         self.output_dict[gw] = gw_combined
         self.cumulative_dict[gw] = gw_cum_combined
 
