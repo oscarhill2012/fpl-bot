@@ -106,7 +106,7 @@ vaastav_map = {
     "minutes":                      "minutes",
     "starts":                       "starts",
     "value":                        "price",
-    "total_points":                 "total_points",
+    "total_points":                 "points",
     "transfers_in":                 "transfers_in",
     "transfers_out":                "transfers_out",
     "goals_scored":                 "goals_per_90",
@@ -187,15 +187,20 @@ class dfProvider:
         self.cfg = config
         self.season_root = season_root
         self._cum = None
-        self._cum_map = {}
 
         # check if stacked df, one initial load saves time
         if self.cfg.stacked is True:
             self._stacked_data = pd.read_csv(self.season_root + self.cfg.gw_path)
 
-        # generate columns of cumulative data 
-        for cols in self.cfg.col_map.values():
-            self._cum_map[cols] = "cum_" + cols.replace("_per_90", "")
+        # generate columns of cumulative data
+        # map between per_90 and cumulative, and visa versa
+        self._cum_map = {}
+        self._cum_rev = {}
+        for out_col in self.cfg.col_map.values():
+            cum_col = "cum_" + out_col.replace("_per_90", "")
+            self._cum_map[out_col] = cum_col
+            if "per_90" in out_col:
+                self._cum_rev[cum_col] = out_col
     
     def reset(self):
         self._cum = None
@@ -222,10 +227,10 @@ class dfProvider:
         if missing:
             logger.warning(f"GW{gw}: missing source columns: {missing}")
 
-        # if df contains none epl matches, remove them
+        # if df contains non-epl matches, remove them
         if self.cfg.other_games is True:
             col, pattern = next(iter(self.cfg.denotes_epl.items()))
-            df = df[df[col].str.contains(pattern)]
+            df = df[df[col].str.contains(pattern, regex=False)]
 
         # checks if data set empty
         if df.empty:
@@ -233,39 +238,73 @@ class dfProvider:
 
         # load output columns to list
         output_cols = list(self.cfg.col_map.values())
+        
+        # rename to output column names
+        df = df.rename(columns=self.cfg.player_id | self.cfg.col_map)
+
+        # guard: coerce all output columns to numeric (real data may have string-typed floats)
+        cols_to_coerce = [c for c in output_cols if c in df.columns]
+        df[cols_to_coerce] = df[cols_to_coerce].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+        # extract cumulative points BEFORE groupby — in a DGW both rows carry
+        # the same cumulative total, so sum() would double it; max() is correct
+        points_series = None
+        if "points" in df.columns:
+            points_series = df.groupby("player_id")["points"].max()
+            df = df.drop(columns="points")
+
+        # aggregate (sums DGW appearances)
+        df = df.groupby("player_id", as_index=False).sum(numeric_only=True)
+        if points_series is not None:
+            df["points"] = df["player_id"].map(points_series).fillna(0.0)
 
         # process df
         df = (
-            df
-            .rename(columns=self.cfg.player_id | self.cfg.col_map)                      # enforce naming convention         
-            .groupby("player_id", as_index=False).sum(numeric_only=True)                # sums incase of dgw
+            df        
             .merge(self.cfg.id_map, on="player_id", how="right")                        # add all players (including those who didnt play),
-            .fillna(0)                                                                  # setting all stats 0 if they didn't feature
+            .fillna(0.0)                                                                # setting all stats 0 if they didn't feature
             .set_index("player_code")                                                   # index by player code
             .filter(items=output_cols)                                                  # select only output columns
-            .apply(**{col: func(df[col]) for col, func in self.cfg.transform.items()})  # apply transforms
         )
+        # cast per_90 columns to float
+        per_90_cols = [c for c in df.columns if "per_90" in c]
+        if per_90_cols:
+            df[per_90_cols] = df[per_90_cols].astype(float)
 
-        # snapshot previous points
-        prev_points = self._cum["cum_points"].copy() if self._cum is not None else 0 
-
+        # apply transforms
+        if self.cfg.transform:
+            df = df.assign(**{
+                col: func(df[col])
+                for col, func in self.cfg.transform.items() if col in df.columns
+            })
+        # snapshot previous points, if loaded df handles points...
+        prev_points = (
+            self._cum["cum_points"].copy() 
+            if (self._cum is not None and "cum_points" in self._cum) 
+            else 0
+        )
         # populate cumulative df if none exists, else add to existing df
         if self._cum is None:
             self._cum = df[output_cols].rename(columns=self._cum_map).copy()
         else:
-            self._cum = self._cum.add(df[output_cols].rename(columns=self._cum_map), fill_value = 0)
+            self._cum = self._cum.add(df[output_cols].rename(columns=self._cum_map), fill_value = 0.0)
 
-        # if dataset contains points, it needs to be differenced (we want points from given game)
+        # data sets gives us total_points (already renamed to "points"), must difference
+        # we also set cumulative to total_points, else we are double counting in previous sum
         if "points" in df.columns:
+            self._cum["cum_points"] = df["points"].values
             df["points"] = self._cum["cum_points"] - prev_points
-            df = df.drop("points", axis=1)
-
 
         # per_90_ify and for rows of df where minutes != 0, this implies cum =! 0 by definition
         per_90_features = [v for v in output_cols if "per_90" in v]
+        # only per_90ify if minutes not 0, else div by 0
         mask = df["minutes"] != 0
-        df.loc[mask, per_90_features] = self._cum.loc[mask, per_90_features].div(self._cum.loc[mask, "cum_minutes"] / 90, axis=0)
-      
+        if per_90_features and mask.any():
+            df.loc[mask, per_90_features] = (
+                self._cum.loc[mask, self._cum_rev.keys()]
+                .rename(columns=self._cum_rev)
+                .div(self._cum.loc[mask, "cum_minutes"] / 90, axis=0)
+            )
         return df
 
         
@@ -297,13 +336,10 @@ class Ingester:
     """
 
     def _merge_dfs(self, fpl: pd.DataFrame, opta: pd.DataFrame) -> pd.DataFrame:
-        # any final processing for fpl and opta datasets
-        fpl = (
-            fpl
-        )
-        opta = (
-            opta
-        )
+        # remove any columns from opta that overlap with fpl
+        # NOTE: we prioritise fpl data, when tested minutes differed to 5% in opta but else consistent
+        overlap = fpl.columns.intersection(opta.columns)
+        opta = opta.drop(columns=overlap, errors="ignore")
         return pd.concat([fpl, opta], axis=1)
 
     """
@@ -321,7 +357,7 @@ class Ingester:
         Ingests bulk data from a gameweek range
         """
         # warn user if running ingest() without reset
-        if not self.cumulative_dict:
+        if self.cumulative_dict:
             logger.warning("Cumulative tally has not been reset, proceed with caution.")
 
         # load opta and fpl api stats
@@ -329,12 +365,12 @@ class Ingester:
             # drop minutes from opta data
             gw_combined = self._merge_dfs(
                 self.fpl_provider.load_gameweek(gw), 
-                self.opta_provider.load_gameweek(gw).drop(columns="minutes", errors="ignore"),
+                self.opta_provider.load_gameweek(gw),
             )
             # drop cumulative points as this was only used for differencing to get points
             gw_cum_combined = self._merge_dfs(
-                self.fpl_provider._cum.drop(columns="cum_minutes", errors="ignore"), 
-                self.opta_provider._cum.drop(columns="cum_minutes", errors="ignore"),
+                self.fpl_provider._cum, 
+                self.opta_provider._cum,
             )
             self.output_dict[gw] = gw_combined
             self.cumulative_dict[gw] = gw_cum_combined
@@ -351,12 +387,12 @@ class Ingester:
         # drop minutes from opta data
         gw_combined = self._merge_dfs(
             self.fpl_provider.load_gameweek(gw), 
-            self.opta_provider.load_gameweek(gw).drop(columns="minutes", errors="ignore"),
+            self.opta_provider.load_gameweek(gw),
         )
         # drop cumulative points as this was only used for differencing to get points
         gw_cum_combined = self._merge_dfs(
-            self.fpl_provider._cum.drop(columns="cum_minutes", errors="ignore"), 
-            self.opta_provider._cum.drop(columns="cum_minutes", errors="ignore"),
+            self.fpl_provider._cum, 
+            self.opta_provider._cum,
         )
         self.output_dict[gw] = gw_combined
         self.cumulative_dict[gw] = gw_cum_combined

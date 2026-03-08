@@ -49,12 +49,12 @@ def _weighted_average(
     # load to dict for ease
     group = {"by": group_cols, "observed": False} if group_cols else {"level": 0}
 
-    # calculate weighted (minutes) average per group
+    # calculate weighted (minutes) average per group, group first for efficency
+    grouped = df.groupby(**group).sum()
     return (
-        df
-        .groupby(**group).sum()
-        .div(df[["cum_minutes"]].groupby(**group).sum(), axis=0)
-        .replace([np.inf, -np.inf, np.nan], 0)
+        grouped
+        .div(grouped["cum_minutes"], axis=0)
+        .replace([np.inf, -np.inf, np.nan], 0.0)
         .drop("cum_minutes", axis=1)
     )
 
@@ -114,10 +114,10 @@ def _compute_level(
     rates = (
         sumation
         .pipe(lambda d: d.drop("cum_minutes", axis=1).div((d["cum_minutes"] / 90), axis=0))
-        .replace([np.inf, -np.inf, np.nan], 0) 
+        .replace([np.inf, -np.inf, np.nan], 0.0) 
     ) 
     # find weighted averages of snapshot features
-    snapshots = _weighted_average(df[weighted_cols + ["cum_minutes"]], group_cols)
+    snapshots = _weighted_average(df[weighted_cols + ["cum_minutes"] + group_cols], group_cols)
     
     # join snapshot and rate calculations
     combined = rates.join(snapshots).join(sumation["cum_minutes"])
@@ -146,7 +146,8 @@ def _compute_individual(
     rates = (
         filtered[rate_cols]
         .pipe(lambda d: d[d["cum_minutes"] > min_mins])
-        .pipe(lambda d: d.drop("cum_minutes", axis=1).div((d["cum_minutes"] / 90), axis=0))       
+        .pipe(lambda d: d.drop("cum_minutes", axis=1).div((d["cum_minutes"] / 90), axis=0))  
+        .replace([np.inf, -np.inf, np.nan], 0.0)     
     )
     
     # find weighted averages of snapshot features, only over players with minutes > 450
@@ -210,12 +211,10 @@ def compute_priors(
         .drop(["position", "team"], axis=1)
         .sum()
     )
-    league["league"] = (
-        sumation
-        .pipe(lambda d: d.drop("cum_minutes").div((d["cum_minutes"] / 90), axis=0))
-        .join(sumation["cum_minutes"])
-        .to_dict()
-    )
+    rates = sumation.drop("cum_minutes").div(sumation["cum_minutes"] / 90)
+    rates = rates.replace([np.inf, -np.inf, np.nan], 0.0)
+    rates["cum_minutes"] = sumation["cum_minutes"]
+    league["league"] = rates.to_dict()
     
     return PriorData(
         league=league,

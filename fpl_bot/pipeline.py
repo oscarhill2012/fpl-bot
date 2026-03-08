@@ -22,9 +22,9 @@ class _LinearScaler:
         max_value: torch.Tensor | None = None,   # unused, for interface consistency
         min_value: torch.Tensor | None = None,   # unused, for interface consistency
     ):
-        self.eps = eps
-        self.device = device
-        self._fitted = False
+        self.eps = eps              # tolerance to ensure no NAN ouputs
+        self.device = device        # all tensors must be on device or error
+        self._fitted = False        # fitted state to stop transforms before fit
         self.location = None
         self.scale = None
 
@@ -66,7 +66,6 @@ class _LinearScaler:
         self.location = x_sel.mean(dim=0, keepdim=True)
         self.scale = x_sel.std(dim=0, keepdim=True, correction=0).clamp(min=self.eps)
 
-        # return state, fitted allows transform, inverse and get params
         self._fitted = True
         return self
 
@@ -81,13 +80,11 @@ class _LinearScaler:
         # NAN input will corrupt data
         if torch.isnan(x).any().item():
             raise RuntimeError('Scaling parameters contains NAN')
-
-        # ensure params are on device
+    
         self.location = params[0, :].to(self.device)
         self.scale = params[1, :].to(self.device)
-
-        # set fitted state and transform input with given params, ouput is [n_samples, n_scaled_features]
         self._fitted = True
+        #transform input with given params, ouput is [n_samples, n_scaled_features]
         return self.transform(x)
 
     def fit_inverse_from_params(self, x: torch.Tensor, params: torch.Tensor):
@@ -101,8 +98,7 @@ class _LinearScaler:
         # NAN input will corrupt data
         if torch.isnan(params).any().item():
             raise RuntimeError('Scaling parameters contains NAN')
-
-        # ensure params are on device        
+    
         self.location = params[0, :].to(self.device)
         self.scale = params[1, :].to(self.device)
 
@@ -111,13 +107,12 @@ class _LinearScaler:
         return self.inverse_transform(x)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
-        # cannot transform if no parameters
         if not self._fitted:
             raise RuntimeError("Must call fit() before transform().")
 
         # clone to avoid mutation and set to deivice
         x = x.clone().to(self.device)        
-        # send through transform to allow transform before linear scale
+        # send through hook to allow non-linear transforms before linear scale in inherited classes
         x = self._transform_input(x)
 
         # transform tensor, ouput is [n_samples, n_scaled_features]
@@ -127,11 +122,9 @@ class _LinearScaler:
         return self.fit(x).transform(x)
 
     def inverse_transform(self, x: torch.Tensor) -> torch.Tensor:
-        # cannot inverse with no parameters
         if not self._fitted:
             raise RuntimeError("Must call fit() before inverse_transform().")
 
-        # clone to avoid mutation and set to deivice
         x = x.clone().to(self.device)
 
         # inverse transform 
@@ -149,7 +142,6 @@ class _LogScaler(_LinearScaler):
         max_value: torch.Tensor | None = None,  # unused, for interface consistency
         min_value: torch.Tensor | None = None,  # unused, for interface consistency
     ):
-        # inherit from linear scaler
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
 
 
@@ -169,11 +161,11 @@ class _LogScaler(_LinearScaler):
     def _transform_input(self, x: torch.Tensor) -> torch.Tensor:
         # validate 
         self._validate(x)
-        # log (1 + x)
+        # log(1+x)
         return torch.log1p(x)
 
     def _inverse_transform_input(self, x: torch.Tensor) -> torch.Tensor:
-        # e^(1+x)
+        # e^(x-1)
         return torch.expm1(x)
 
 
@@ -186,17 +178,16 @@ class _RobustScaler(_LinearScaler):
         max_value: torch.Tensor | None = None,   # unused, for interface consistency
         min_value: torch.Tensor | None = None,   # unused, for interface consistency
     ):
-        # inherit from linear scaler
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
 
     '''
-    Re-write fit for IQR and median
+    Robust scaling is more resilient to outliers.
+    Re-write fit for IQR and median.
     '''
 
     def fit(self, x: torch.Tensor) -> '_RobustScaler':
         # clone to avoid mutation and set to deivice
         x = x.clone().to(self.device)        
-        # send through transform to allow transform before linear scale
         x_sel = self._transform_input(x)
 
         # find median and iqr, both shape [1, n_scaled_features]
@@ -219,7 +210,6 @@ class _RobustLog(_RobustScaler):
         max_value: torch.Tensor | None = None,   # unused, for interface consistency
         min_value: torch.Tensor | None = None,   # unused, for interface consistency
     ):
-        # inherit from linear scaler
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
 
     '''
@@ -255,10 +245,13 @@ class _BoundedScaler(_LinearScaler):
         max_value: torch.Tensor | None = None,   # unused, for interface consistency
         min_value: torch.Tensor | None = None,   # unused, for interface consistency
     ):
-        # inherit from lienar scaler
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
-        # since bounded we now need max and min values as scaling params
-        self.max_value = max_value.to(self.device)
+        # max_value generally not 0, but maybe we'd call for data < 0 and want min value < 0 and max = 0
+        self.max_value = (
+            min_value.to(self.device)
+            if min_value is not None 
+            else torch.zeros(1, self.max_value.shape[1], device=self.device)
+        )
         # min generally 0 but can be set to non-zero if required
         self.min_value = (
             min_value.to(self.device)
@@ -274,7 +267,7 @@ class _BoundedScaler(_LinearScaler):
 
     @property
     def get_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        # cannot call params without fitting, user inputs min and max so redundant in that sense
+        # redundant, as cannot call params without user inputs min and max,
         # but required for interface consistency when storing params for all scalers
         if not self._fitted:
             raise RuntimeError('Must call fit() before get_params()')
@@ -289,28 +282,25 @@ class _BoundedScaler(_LinearScaler):
 
     def fit(self, x: torch.Tensor) -> '_BoundedScaler':
         # user inputs scaling params so this function is redundant
-        # make explicitly do nothing as inherits linear scaler fit() else
+        # make explicitly do nothing as inherits _LinearScaler's fit() else
         return self
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
-        # clone to avoid mutation and set to deivice
         x = x.clone().to(self.device)        
-        # send through transform to allow transform before linear scale
         x_sel = self._transform_input(x)
 
         # return transformed tensor, ouput is [n_samples, n_scaled_features]
         return (x_sel - self.min_value) / (self.max_value - self.min_value)
 
     def fit_transform_from_params(self, x: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        # validate
-        # params must be shape [1, n_scaled_features]
+        # again redundant, 
+        # but for interface consistency we need to be able to call _BoundedScaler with fit from params,
+        # must rewrite function to use min and max not location and scale
         if not x.shape[-1] == params.shape[-1]:
             raise ValueError('Params and Data must both be same n_features')
-        # ensure scaling params are NAN
         if torch.isnan(params).any().item():
             raise RuntimeError('Scaling parameters contain NAN')
 
-        # ensure params are on device
         self.min_value = params[0, :].to(self.device)
         self.max_value = params[1, :].to(self.device)
 
@@ -325,7 +315,6 @@ class _BoundedScaler(_LinearScaler):
         if torch.isnan(x).any().item():
             raise RuntimeError('Scaling parameters contains NAN')
 
-        # ensure params are on device
         self.min_value = params[0, :].to(self.device)
         self.max_value = params[1, :].to(self.device)
 
@@ -333,7 +322,6 @@ class _BoundedScaler(_LinearScaler):
         return self.inverse_transform(x)
     
     def inverse_transform(self, x: torch.Tensor) -> torch.Tensor:
-        # clone to avoid mutation and set to device
         x = x.clone().to(self.device) 
         # inverse scale
         x = (x * (self.max_value - self.min_value)) + self.min_value
@@ -345,9 +333,9 @@ class _BoundedScaler(_LinearScaler):
 class FeatureScaler:
     '''
     Mask aware scaler for tensors shaped [batch, time, features]
-    Note:   his class handles all mask operations, 
-            works with masks values = None as long as torch.Tensor of correct shape,
-            scalers are given 2D tensor as a result of this.
+    Note:   - this class handles all mask operations 
+            - works with masks values = None as long as torch.Tensor of correct shape
+            - scalers are given 2D tensor as a result of this
     '''
 
     def __init__(
@@ -361,10 +349,14 @@ class FeatureScaler:
         self.features = features_cls
         self.eps = eps
         self.device = device
+        # this class generates scaling mask and presence_mask
         self.scaling_masks = {mode: mask.to(self.device) for mode, mask in scaling_masks.items()}
-        self.specs_by_mode = self.features.specs_by_mode
-        self._build_bound_tensor()
         self._build_presence_indices()
+        # specs gives dict{ScalingMode: list of feature names for that mode}
+        self.specs_by_mode = self.features.specs_by_mode
+        # bound tensor is collection of min and max for bound scaling
+        self._build_bound_tensor()
+        # _fitted now refers to the collection of scalers generated upon init
         self._fitted = False
 
         _MODE_TO_SCALER = {
@@ -376,12 +368,14 @@ class FeatureScaler:
             # IDENTITY intentionally absent
         }
 
+        # n_scaled is how many features each scaling mode acts on
         self.n_scaled = {}
+        # dict of scaler instances
         self._scalers = {}
 
         for mode, cls in _MODE_TO_SCALER.items():
             self.n_scaled[mode] = self.scaling_masks[mode].sum().item()
-
+            # initialise scaler instances
             if self.scaling_masks[mode].any().item():
                 self._scalers[mode] = cls(
                     device=self.device,
@@ -395,32 +389,23 @@ class FeatureScaler:
     '''
 
     def _validate_input(self, x: torch.Tensor):
-
         if not isinstance(x, torch.Tensor):
             raise TypeError('Input must be a tensor')
-
         if not torch.is_floating_point(x):
-            raise TypeError(
-                f'Input must be type float, recieved {x.dtype}'
-            )
-        
+            raise TypeError(f'Input must be type float, recieved {x.dtype}')    
         if x.dim() != 3:
-            raise ValueError(
-                f'Expected shape [Batch, Time, Feature], recieved {x.shape}'
-            )
-
+            raise ValueError(f'Expected shape [Batch, Time, Feature], recieved {x.shape}')
         if not x.shape[-1] == len(self.features):
+            # masks generated internally, but double check
             raise RuntimeError('Tensor[Features] dimensions do not match Mask Dimensions')
-
         if not torch.isfinite(x).all().item():
             raise ValueError('Input tensor contains NaN or infinite value(s).')
 
     '''
-    Build any internal features 
+    Build any private functions
     '''
 
     def _build_bound_tensor(self):
-         
         min_vals = []
         max_vals = []
 
@@ -428,17 +413,21 @@ class FeatureScaler:
             if feature.scaling_mode == ScalingMode.BOUNDED:
                 max_vals.append(feature.max_value)
                 min_vals.append(feature.min_value)
-        
+
+        # None makes bound scaler set to 0s
         if not max_vals:
             self.max_vals = None
+        if not min_vals:
             self.min_vals = None
             return self
-            
+
+        # _BoundedScaler requires tensor input [1, n_scaled_features], even if None
         self.max_vals = torch.tensor(max_vals, dtype=torch.float32).unsqueeze(0)
         self.min_vals = torch.tensor(min_vals, dtype=torch.float32).unsqueeze(0)
         return self
 
     def _build_presence_indices(self):
+        # presence indices built from features input upon intialisation
         indices = []
         min_values = []
 
@@ -448,18 +437,26 @@ class FeatureScaler:
                 min_values.append(spec.min_value)
         
         if indices: 
+            # torch.long is signed integers, both shape [1, n_presence_features]
             self._presence_indices = torch.tensor(indices, dtype=torch.long, device=self.device)
             self._presence_min_values = torch.tensor(min_values, dtype=torch.float32, device=self.device)
         else:
+            # None makes presence act as identity
             self._presence_indices = None
             self._presence_min_values = None
         
     def _build_presence_mask(self, x: torch.Tensor):
-        if self._presence_indices is None:    
+        # presence mask built from data and presence indices,
+        # so can only be called upon scale, inverse as requires data tensor x
+        if self._presence_indices is None:
+            # returns all True, allows all data through, no presence filtering 
+            # output shape is [n_samples, n_timesteps]   
             return torch.ones(x.shape[0], x.shape[1], dtype=torch.bool)
 
+        # if sample at time step has presence feature > threshold (min_val)
+        # that sample for that time is given to scaler
         x_check = x[:,:, self._presence_indices].to(self.device)
-        mask = (x_check != self._presence_min_values).all(dim=-1)
+        mask = (x_check > self._presence_min_values).all(dim=-1)
         return mask       
 
     '''
@@ -467,59 +464,70 @@ class FeatureScaler:
     '''
     
     def train_scale(self, x: torch.Tensor) -> [torch.Tensor, dict] :
+        # validate
         self._validate_input(x)
+        # clone to avoid mutation
         x = x.clone()
+        # build presence mask now we have data
         presence_mask = self._build_presence_mask(x).to(self.device)
-
+        
+        # scaler gets data after presence and scaling masks applied
+        # scaling mask is just which type of scaling is applied to which feature
         x_scale = x[presence_mask]   
         for mode, scaler in self._scalers.items():
             x_scale[:, self.scaling_masks[mode]] = scaler.fit_transform(x_scale[:, self.scaling_masks[mode]])
             param1, param2 = scaler.get_params
-            
+            # params stored for each feature scaled
 
             for spec, p1, p2 in zip(self.specs_by_mode[mode], param1[0], param2[0], strict=True):
                 spec.scaling_params = [p1.item(), p2.item()]        
-                # convention p1 is location or min value, p2 is scale or max_value
+                # convention; p1 is location or min value, p2 is scale or max_value
 
+        # inverse presence mask
         x[presence_mask] = x_scale
-
+        # now fitted
         self._fitted = True
+        # return scaled tensor shape = [n_samples, n_timesteps, n_features], and return features dict, now with scaling params
+        # features dict must be given with x as this is the meta data for tensor
         return x, self.features.to_dict()
 
     
     def test_scale(self, x: torch.Tensor) -> torch.Tensor:
+        # training data must be scaled with params from test, or we leak distribution information to model
         if not self._fitted:
             raise RuntimeError('Fit training data before scaling Test')
 
         self._validate_input(x)
         x = x.clone()
         presence_mask = self._build_presence_mask(x).to(self.device)
-
         x_scale = x[presence_mask]
+
         for mode, scaler in self._scalers.items():
             x_scale[:, self.scaling_masks[mode]] = scaler.transform(x_scale[:, self.scaling_masks[mode]])
+            
         x[presence_mask] = x_scale
-
         return x
                 
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         self._validate_input(x)
         x = x.clone()
-        
+
+        #NOTE: check this, if presence feature is scaled, now min_value has changed...
         presence_mask = self._build_presence_mask(x).to(self.device)
         x_inv = x[presence_mask]
 
+        # allow inverse to be called after fitting scalers, or with scaling parameters in feature dict
         for mode, scaler in self._scalers.items():
             if self._fitted:
                 x_inv[:, self.scaling_masks[mode]] = scaler.inverse_transform(x_inv[:, self.scaling_masks[mode]])      
             
             else:
+                # transpose so shape is [n_params, n_features], for broadcasting convinience
                 params = torch.tensor(
                     [s.scaling_params for s in self.specs_by_mode[mode]],
                     dtype = torch.float32,
                 ).T
-
                 x_inv[:, self.scaling_masks[mode]] = scaler.fit_inverse_from_params(x_inv[:, self.scaling_masks[mode]], params)
                 
         x[presence_mask] = x_inv

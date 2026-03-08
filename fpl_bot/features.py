@@ -156,7 +156,6 @@ class Features:
     '''
 
     def to_dict(self):
-        # store features to dict
         return [
             {
                 "name": s.name,
@@ -177,7 +176,6 @@ class Features:
 
     @classmethod
     def from_dict(cls, data):
-        # load features from dict
         specs = []
         for d in data:
             specs.append(
