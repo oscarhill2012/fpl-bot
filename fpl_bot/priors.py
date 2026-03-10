@@ -31,204 +31,239 @@ class PriorData:
             data = json.load(f)
         return cls(**data)
 
-def _weighted_average(
-    df: pd.DataFrame,
-    group_cols: list[str],
-):
-    """
-    Leaving group_cols empty, groups by index
-    WARNING: this class calulates weights, after sum over (feature * weight)
-    """
-    # copy dataframe, so no mutation
-    df = df.copy()
+    @classmethod
+    def from_data(
+        cls,
+        cumulative: dict[int, pd.DataFrame],
+        player_data: dict[int, pd.DataFrame],
+        player_meta: pd.DataFrame,
 
-    # forces pandas to calculate each permutation, even if no data 
-    for col in group_cols:
-        df[col] = df[col].copy().astype("category")
-
-    # load to dict for ease
-    group = {"by": group_cols, "observed": False} if group_cols else {"level": 0}
-
-    # calculate weighted (minutes) average per group, group first for efficency
-    grouped = df.groupby(**group).sum()
-    return (
-        grouped
-        .div(grouped["cum_minutes"], axis=0)
-        .replace([np.inf, -np.inf, np.nan], 0.0)
-        .drop("cum_minutes", axis=1)
-    )
+        min_mins: float = 450.0,
+    ) -> 'PriorData':
+        """Convenience constructor - delegates to PriorComputer."""
+        return PriorComputer(cumulative, player_data, player_meta, min_mins).compute()
 
 
-def _extract_totals(
-    cumulative_dfs: dict[str, pd.DataFrame],
-    player_data: dict[str, pd.DataFrame],
-    player_meta: pd.DataFrame,
-    weighted_cols: list,
-):  
-    # stack player_data into one df
-    player_stacked = pd.concat([df[weighted_cols + ["minutes"]] for df in player_data.values()], axis=0)
-
-    # for snapshot columns we want to start weighted average
-    weighted_snapshots = (    
-        player_stacked[weighted_cols]
-        .multiply(player_stacked["minutes"], axis=0)
-        .groupby(level=0)
-        .sum()
-    )
-
-    # for cumulative data we just want most recent count
-    cumulative = cumulative_dfs[max(cumulative_dfs.keys())]
-
-    # combine 
-    output = (
-        pd.concat([player_meta, cumulative, weighted_snapshots], axis=1)
-        .fillna(0)
-    )
-    return output
-
-
-def _compute_level(
-    df: pd.DataFrame,
-    weighted_cols: list,
-    group_cols: list[str],
-) -> dict[str, dict[str, float]]:
-    # copy dataframe, so no mutation
-    df = df.copy()
-
-    # rate columns
-    rate_cols = [col for col in df.columns if "cum_" in col]
-
-    # forces pandas to calculate each permutation, even if no data
-    for col in group_cols:
-        df[col] = df[col].astype("category")
-
-    # load to dict for ease
-    group = {"by": group_cols, "observed": False}
-
-    # find per_90 averages for groups
-    sumation = (
-        df[rate_cols + group_cols]
-        .groupby(**group)
-        .sum()
-    )
-    rates = (
-        sumation
-        .pipe(lambda d: d.drop("cum_minutes", axis=1).div((d["cum_minutes"] / 90), axis=0))
-        .replace([np.inf, -np.inf, np.nan], 0.0) 
-    ) 
-    # find weighted averages of snapshot features
-    snapshots = _weighted_average(df[weighted_cols + ["cum_minutes"] + group_cols], group_cols)
-    
-    # join snapshot and rate calculations
-    combined = rates.join(snapshots).join(sumation["cum_minutes"])
-
-    # populate results dict, idx is tuple for multiple group_cols, str for single
-    result = {}
-    for idx, row in combined.iterrows():
-        key = "_".join(str(i) for i in idx) if isinstance(idx, tuple) else str(idx)
-        result[key] = row.to_dict()
-    
-    return result
-
-def _compute_individual(
-    df: pd.DataFrame,
-    weighted_cols: list,
-    min_mins: float,
-    group_cols: list,
-) -> dict[str, dict[str, float]]:
-    # rate columns
-    rate_cols = [col for col in df.columns if "cum_" in col]
-
-    #filter minutes
-    filtered = df[df["cum_minutes"] > min_mins]
-
-    # calculate per 90 rates per player, after filtering minutes
-    rates = (
-        filtered[rate_cols]
-        .pipe(lambda d: d[d["cum_minutes"] > min_mins])
-        .pipe(lambda d: d.drop("cum_minutes", axis=1).div((d["cum_minutes"] / 90), axis=0))  
-        .replace([np.inf, -np.inf, np.nan], 0.0)     
-    )
-    
-    # find weighted averages of snapshot features, only over players with minutes > 450
-    snapshots = _weighted_average(filtered[weighted_cols + ["cum_minutes"]], group_cols)
-    
-    # join snapshot and rate calculations
-    combined = rates.join(snapshots).join(filtered["cum_minutes"])
-
-    # construct dict
-    result = {}
-    for idx, row in combined.iterrows():
-        result[str(idx)] = row.to_dict()
-
-    return result
-
-def compute_priors(
-    cumulative: dict[int, pd.DataFrame],
-    player_data: dict[int, pd.DataFrame],
-    player_meta: pd.DataFrame,
-    min_mins: float = 450.0, 
-) -> "PriorData":
+class PriorComputer:
     """
     Computes hierarchical per-90 priors from ingester output.
-    Data-agnostic — works with any number of gameweeks.
-    Uses max(cumulative_dict.keys()) as the latest available snapshot.
+    Data-agnostic, works with any number of gameweeks.
+    Uses max(cumulative.keys()) as the latest available snapshot.
 
     Args:
-        cumulative_dict:  from ingester — raw cumulative counts per (player, gw)
-        output_dict:      from ingester — per-GW features and per-90 rates
-        player_meta:      DataFrame with [player_code, position, team_code]
-        min_minutes:      minimum cumulative minutes for a player to qualify
-                          for individual-level priors (default 450 ≈ 5 full matches)
-
-    Returns:
-        PriorData containing three hierarchy levels + metadata
+        cumulative:   from ingester, raw cumulative counts per (player, gw)
+        player_data:  from ingester, per-GW features and per-90 rates
+        player_meta:  DataFrame with [player_code, position, team_code]
+        min_mins:     minimum cumulative minutes for a player to qualify
+                      for individual-level priors (default 450 ≈ 5 full matches)
+        cum_rev_map:  maps cum_ columns to _per_90 columns for consistency with ingester
     """
-    # test input:
-    if cumulative.keys() != player_data.keys():
-        raise RuntimeError("Inconsistent no. of GWs entered into compute priors")
-    for key in cumulative.keys():
-        if (cumulative[key].index.name != "player_code") or (player_data[key].index.name != "player_code"):
-            raise TypeError("compute_priors() requires index is player_code for all df")
+
+    def __init__(
+        self,
+        cumulative: dict[int, pd.DataFrame],
+        player_data: dict[int, pd.DataFrame],
+        player_meta: pd.DataFrame,
+        cum_rev_map: dict[str, str],
+        min_mins: float = 450.0,
+    ):
+        self.cumulative = cumulative
+        self.player_data = player_data
         
-    # set index as player_code
-    player_meta = player_meta.set_index("player_code")
-    weighted_cols = ["points", "value"]
+        self.cum_rev_map = cum_rev_map      
+        self.min_mins = min_mins
+        self.latest_gw = max(cumulative.keys())
+        self.weighted_cols = ["points", "value"]
 
-    # extract season wide totals and weighted averages
-    latest_gw = max(cumulative.keys())
-    totals = _extract_totals(cumulative, player_data, player_meta, weighted_cols)
+        if "player_id" in player_meta.columns:
+            self.player_meta = player_meta.set_index("player_code")
+        else: 
+            self.player_meta = player_meta
 
-    # calculate league, position, position_team and individual
-    position = _compute_level(totals, weighted_cols , group_cols=["position"])
-    pos_team = _compute_level(totals, weighted_cols , group_cols=["position", "team"])
-    players = _compute_individual(totals, weighted_cols, min_mins, group_cols=[])
-    
-    # find league averages:
-    league = {}
-    sumation = (
-        totals
-        .drop(["position", "team"], axis=1)
-        .sum()
-    )
-    rates = sumation.drop("cum_minutes").div(sumation["cum_minutes"] / 90)
-    rates = rates.replace([np.inf, -np.inf, np.nan], 0.0)
-    rates["cum_minutes"] = sumation["cum_minutes"]
-    league["league"] = rates.to_dict()
-    
-    return PriorData(
-        league=league,
-        position=position,
-        position_team=pos_team,
-        individual=players,
-        meta_data = {
-            "latest_gw": latest_gw,
-            "min_minutes": min_mins,
-            "n_players_tot": len(player_meta),
-            "n_player_mins_req": len(players),
-            "weighted_cols": [cols for cols in player_data[max(cumulative.keys())].columns if "per_90" not in cols],
-            "per_90_cols": [cols for cols in player_data[max(cumulative.keys())].columns if "per_90" in cols],
-        }
-    )
+        # populated during compute()
+        self.totals: pd.DataFrame | None = None
 
+        self._validate_input()
+
+    # --- Validation ---
+
+    def _validate_input(self):
+        if self.cumulative.keys() != self.player_data.keys():
+            raise RuntimeError("Inconsistent no. of GWs entered into compute priors")
+        for key in self.cumulative.keys():
+            if (self.cumulative[key].index.name != "player_code") or (self.player_data[key].index.name != "player_code"):
+                raise TypeError("compute_priors() requires index is player_code for all df")
+
+    # --- Private helpers ---
+
+    def _extract_totals(self) -> pd.DataFrame:
+        # stack player_data into one df
+        player_stacked = pd.concat([df[self.weighted_cols + ["minutes"]] for df in self.player_data.values()], axis=0)
+
+        # for snapshot columns we want to start weighted average
+        weighted_snapshots = (    
+            player_stacked[self.weighted_cols]
+            .multiply(player_stacked["minutes"], axis=0)
+            .groupby(level=0)
+            .sum()
+        )
+
+        # for cumulative data we just want most recent count
+        cumulative = self.cumulative[max(self.cumulative.keys())]
+
+        # combine 
+        output = (
+            pd.concat([self.player_meta, cumulative, weighted_snapshots], axis=1)
+            .fillna(0)
+        )
+        return output
+
+    def _compute_league(self) -> dict[str, dict[str, float]]:
+        # find league averages:
+        league = {}
+        sumation = (
+            self.totals
+            .drop(["position", "team"], axis=1)
+            .sum()
+        )
+        rates = sumation.drop("cum_minutes").div(sumation["cum_minutes"] / 90)
+        rates = rates.replace([np.inf, -np.inf, np.nan], 0.0)
+        rates["cum_minutes"] = sumation["cum_minutes"]
+        
+        # rename to per_90 column names
+        rates = rates.rename(columns=self.cum_rev_map)
+
+        league["league"] = rates.to_dict()
+
+        return league
+
+    def _compute_level(self, group_cols: list[str]) -> dict[str, dict[str, float]]:
+        # copy dataframe, so no mutation
+        df = self.totals.copy()
+
+        # rate columns
+        rate_cols = [col for col in df.columns if "cum_" in col]
+
+        # forces pandas to calculate each permutation, even if no data
+        for col in group_cols:
+            df[col] = df[col].astype("category")
+
+        # load to dict for ease
+        group = {"by": group_cols, "observed": False}
+
+        # find per_90 averages for groups
+        sumation = (
+            df[rate_cols + group_cols]
+            .groupby(**group)
+            .sum()
+        )
+        rates = (
+            sumation
+            .pipe(lambda d: d.drop("cum_minutes", axis=1).div((d["cum_minutes"] / 90), axis=0))
+            .replace([np.inf, -np.inf, np.nan], 0.0) 
+        ) 
+        # find weighted averages of snapshot features
+        snapshots = self._weighted_average(df[self.weighted_cols + ["cum_minutes"] + group_cols], group_cols)
+        
+        # join snapshot and rate calculations
+        combined = rates.join(snapshots).join(sumation["cum_minutes"])
+
+        # rename to per_90 column names
+        rates = rates.rename(columns=self.cum_rev_map)
+
+        # populate results dict, idx is tuple for multiple group_cols, str for single
+        result = {}
+        for idx, row in combined.iterrows():
+            key = "_".join(str(i) for i in idx) if isinstance(idx, tuple) else str(idx)
+            result[key] = row.to_dict()
+        
+        return result
+
+    def _compute_individual(self) -> dict[str, dict[str, float]]:
+        df = self.totals
+
+        # rate columns
+        rate_cols = [col for col in df.columns if "cum_" in col]
+
+        #filter minutes
+        filtered = df[df["cum_minutes"] > self.min_mins]
+
+        # calculate per 90 rates per player, after filtering minutes
+        rates = (
+            filtered[rate_cols]
+            .pipe(lambda d: d[d["cum_minutes"] > self.min_mins])
+            .pipe(lambda d: d.drop("cum_minutes", axis=1).div((d["cum_minutes"] / 90), axis=0))  
+            .replace([np.inf, -np.inf, np.nan], 0.0)     
+        )
+        
+        # rename to per_90 column names
+        rates = rates.rename(columns=self.cum_rev_map)
+
+        # find weighted averages of snapshot features, only over players with minutes > 450
+        snapshots = self._weighted_average(filtered[self.weighted_cols + ["cum_minutes"]], [])
+        
+        # join snapshot and rate calculations
+        combined = rates.join(snapshots).join(filtered["cum_minutes"])
+
+        # construct dict
+        result = {}
+        for idx, row in combined.iterrows():
+            result[str(idx)] = row.to_dict()
+
+        return result
+
+    @staticmethod
+    def _weighted_average(
+        df: pd.DataFrame,
+        group_cols: list[str],
+    ):
+        """
+        Leaving group_cols empty, groups by index
+        WARNING: this class calulates weights, after sum over (feature * weight)
+        """
+        # copy dataframe, so no mutation
+        df = df.copy()
+
+        # forces pandas to calculate each permutation, even if no data 
+        for col in group_cols:
+            df[col] = df[col].copy().astype("category")
+
+        # load to dict for ease
+        group = {"by": group_cols, "observed": False} if group_cols else {"level": 0}
+
+        # calculate weighted (minutes) average per group, group first for efficency
+        grouped = df.groupby(**group).sum()
+        return (
+            grouped
+            .div(grouped["cum_minutes"], axis=0)
+            .replace([np.inf, -np.inf, np.nan], 0.0)
+            .drop("cum_minutes", axis=1)
+        )
+
+    # --- Public Functions ---
+
+    def compute(self) -> PriorData:
+        """Main entry point — orchestrates the full pipeline."""
+        self.totals = self._extract_totals()
+
+        # calculate league, position, position_team and individual
+        league = self._compute_league()
+        position = self._compute_level(group_cols=["position"])
+        pos_team = self._compute_level(group_cols=["position", "team"])
+        players = self._compute_individual()
+
+        return PriorData(
+            league=league,
+            position=position,
+            position_team=pos_team,
+            individual=players,
+            meta_data={
+                "latest_gw": self.latest_gw,
+                "min_minutes": self.min_mins,
+                "n_players_tot": len(self.player_meta),
+                "n_player_mins_req": len(players),
+                "weighted_cols": [cols for cols in self.player_data[max(self.cumulative.keys())].columns if "per_90" not in cols],
+                "per_90_cols": [cols for cols in self.player_data[max(self.cumulative.keys())].columns if "per_90" in cols],
+            }
+        )
 

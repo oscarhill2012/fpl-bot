@@ -311,12 +311,12 @@ class GameweekProvider:
         # process df
         df = (
             df  
-            .reset_index()                                          # reset index from player_id        
+            .reset_index()                                          # reset index from .groupby      
             .merge(self.cfg.id_map, on="player_id", how="right")    # add all players (including those who didnt play),
             .fillna(0.0)                                            # setting all stats 0 if they didn't feature
             .set_index("player_code")                               # index by player code
             .filter(items=output_cols)                              # select only output columns
-            .astype(float)                                          # cast all columns as float
+            .astype(float)                                          # cast all columns as float, player_code safe as index
         )
 
         # apply transforms
@@ -358,8 +358,9 @@ class Ingester:
         self.season_root = season_root
         self.fpl_provider = GameweekProvider(fpl_config, season_root)
         self.opta_provider = GameweekProvider(opta_config, season_root)
-        self.output_dict = {}
-        self.cumulative_dict = {}
+        self.player_gw_stats: dict[int, pd.DataFrame] = {}
+        self.player_cumulative_stats: dict[int, pd.DataFrame] = {}
+        self.first_gw: dict[int, int] = {}
 
     # --- Helper Functions ---
 
@@ -369,6 +370,19 @@ class Ingester:
         overlap = fpl.columns.intersection(opta.columns)
         opta = opta.drop(columns=overlap, errors="ignore")
         return pd.concat([fpl, opta], axis=1)
+
+    def _update_first_gw(self, df: pd.DataFrame, gw: int) -> "Ingester":
+        """
+        Stores first gameweek a player appears in, to dict.
+        """
+        # isolate players that played this gameweek
+        played = df.index[df["minutes"] > 0]
+
+        # pandas search in C so quicker than if statement
+        new_players = played.difference(self.first_gw.keys())
+
+        self.first_gw.update({pc: gw for pc in new_players})
+        return self
 
     def _process_gw(self, gw: int):
         # uses instances of GameweekProvider to load gw
@@ -381,6 +395,7 @@ class Ingester:
             self.fpl_provider.cumulative_df, 
             self.opta_provider.cumulative_df,
         )
+        self._update_first_gw(gw_combined[gw], gw)
         return gw_combined, gw_cum_combined
 
     # --- Public Functions ---
@@ -389,6 +404,7 @@ class Ingester:
         logger.info("FPL and Opta cumulative tallies have been reset.")
         self.fpl_provider.reset()
         self.opta_provider.reset()
+        self.first_gw = {}
         return self       
 
     def ingest(self, gameweek_start: int, gameweek_end: int) -> dict[str, pd.DataFrame]:
@@ -396,13 +412,13 @@ class Ingester:
         Ingests bulk data from a gameweek range
         """
         # warn user if running ingest() without reset
-        if self.cumulative_dict:
+        if self.player_cumulative_stats:
             logger.warning("Cumulative tally has not been reset, proceed with caution.")
 
         for gw in range(gameweek_start, gameweek_end+1):
-            self.output_dict[gw], self.cumulative_dict[gw] = self._process_gw(gw)
+            self.player_gw_stats[gw], self.player_cumulative_stats[gw] = self._process_gw(gw)
 
-        return self.output_dict, self.cumulative_dict
+        return self.player_gw_stats, self.player_cumulative_stats
 
     def append_gw(self, gw: int) -> dict[str, pd.DataFrame]:
         """
@@ -410,5 +426,5 @@ class Ingester:
         WARNING: for functionality append_gw() never resets cumulative data,
                  please explicitly call reset() if required.
         """
-        self.output_dict[gw], self.cumulative_dict[gw] = self._process_gw(gw)
-        return self.output_dict, self.cumulative_dict
+        self.player_gw_stats[gw], self.player_cumulative_stats[gw] = self._process_gw(gw)
+        return self.player_gw_stats, self.player_cumulative_stats
