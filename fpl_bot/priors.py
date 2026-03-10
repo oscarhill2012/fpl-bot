@@ -1,9 +1,7 @@
 import pandas as pd
 import numpy as np
 import logging
-from enum import Enum
 from dataclasses import dataclass
-from typing import Callable
 import json
 from .features import Features, FeatureSpec, FeatureType
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +19,8 @@ class PriorData:
     individual: dict[str, dict[str, float]]     # keys are str because JSON requires string keys
     meta_data: dict                             #
 
+    # --- Public Functions & Methods ---
+    
     def to_json(self, path: str):
         with open(path + f"GW{self.meta_data['latest_gw']}_priors.json", "w") as f:
             json.dump(self.__dict__, f)

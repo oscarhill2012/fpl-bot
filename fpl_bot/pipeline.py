@@ -13,7 +13,7 @@ class _LinearScaler:
     '''
     Recieves a tensor [n_samples, n_features]
     fits(), transforms() and inverse_transorms() 
-    standardisation
+    Standard scaling; by standad deviation (std) and mean
     '''
     def __init__(
         self,
@@ -28,9 +28,7 @@ class _LinearScaler:
         self.location = None
         self.scale = None
 
-    '''
-    Hook, for subclass. 
-    '''
+    # --- Hooks (for subclasses) ---
 
     def _transform_input(self, x: torch.Tensor) -> torch.Tensor:
         return x
@@ -38,9 +36,7 @@ class _LinearScaler:
     def _inverse_transform_input(self, x: torch.Tensor) -> torch.Tensor:
         return x 
 
-    '''
-    Return scaling params
-    '''
+    # --- Propterties ---
 
     @property
     def get_params(self) -> [torch.Tensor, torch.Tensor]:
@@ -51,10 +47,7 @@ class _LinearScaler:
         return self.location, self.scale
         # WARNING: order of output is convention
 
-    '''
-    Fit, Transform and Inverse, 
-    fit_from_params allows scaling sample populations with different parameters
-    '''
+    # --- Public Functions ---
 
     def fit(self, x: torch.Tensor) -> '_LinearScaler':
         # clone to avoid mutation and send to device 
@@ -70,6 +63,10 @@ class _LinearScaler:
         return self
 
     def fit_transform_from_params(self, x: torch.Tensor, params: torch.Tensor):
+        """
+        Allows for transformation, with given params.
+        Important for test sets, as these should not leak information about their distribution to models.
+        """
         # validate input
         # params must be shape [1, n_scaled_features]
         if not x.shape[-1] == params.shape[-1]:
@@ -135,7 +132,9 @@ class _LinearScaler:
 
 
 class _LogScaler(_LinearScaler):
-
+    """
+    Log scaler; ln(1+x), then standard scaler.
+    """
     def __init__(self,
         device: str,
         eps: float = 1e-8,
@@ -145,23 +144,19 @@ class _LogScaler(_LinearScaler):
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
 
 
-    '''
-    Validate 
-    '''
+    # --- Validation ---
 
     def _validate(self, x: torch.Tensor):
         # ensures no values below -1 so log doesnt produce NAN
         if (x < -1).any().item():
             raise ValueError('Feature to be Log scaled contains value < -1')
 
-    '''
-    Re-write hooks
-    '''
+    # --- Hooks ---
 
     def _transform_input(self, x: torch.Tensor) -> torch.Tensor:
         # validate 
         self._validate(x)
-        # log(1+x)
+        # ln(1+x)
         return torch.log1p(x)
 
     def _inverse_transform_input(self, x: torch.Tensor) -> torch.Tensor:
@@ -170,7 +165,10 @@ class _LogScaler(_LinearScaler):
 
 
 class _RobustScaler(_LinearScaler):
-
+    """
+    Robust scaler is more resilient to outliers.
+    Uses IQR and Median intead of mean and std.
+    """
     def __init__(
         self,
         device: str,
@@ -180,10 +178,7 @@ class _RobustScaler(_LinearScaler):
     ):
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
 
-    '''
-    Robust scaling is more resilient to outliers.
-    Re-write fit for IQR and median.
-    '''
+    # --- Public Functions ---
 
     def fit(self, x: torch.Tensor) -> '_RobustScaler':
         # clone to avoid mutation and set to deivice
@@ -212,18 +207,14 @@ class _RobustLog(_RobustScaler):
     ):
         super().__init__(device=device, eps=eps, max_value=max_value, min_value=min_value)
 
-    '''
-    Re-write hooks
-    '''
+    # --- Validation ---
 
     def _validate(self, x: torch.Tensor):
         # ensure no values below -1 so log doesnt NAN
         if (x < -1).any().item():
             raise ValueError('Feature to be Log-Robust scaled contains value < -1')
 
-    '''
-    Re-write hooks
-    '''
+    # --- Hooks ---
 
     def _transform_input(self, x: torch.Tensor) -> torch.Tensor:
         # validate
@@ -261,9 +252,7 @@ class _BoundedScaler(_LinearScaler):
         self._fitted = True     # bounded scaler does not fit to params, min and max inputted, 
                                 # self._fitted is unused for inferface consistency
     
-    '''
-    Return scaling params
-    '''
+    # --- Properties ---
 
     @property
     def get_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -275,10 +264,7 @@ class _BoundedScaler(_LinearScaler):
         return self.min_value, self.max_value
         # WARNING: order of output is convention
 
-    '''
-    Fit, Transform, Inverse
-    fit_from_params allows scaling sample populations with different parameters
-    '''
+    # --- Public Functions ---
 
     def fit(self, x: torch.Tensor) -> '_BoundedScaler':
         # user inputs scaling params so this function is redundant
@@ -384,9 +370,7 @@ class FeatureScaler:
                     max_value=self.max_vals,
                 )
             
-    '''
-    validation
-    '''
+    # --- Validation ---
 
     def _validate_input(self, x: torch.Tensor):
         if not isinstance(x, torch.Tensor):
@@ -401,9 +385,7 @@ class FeatureScaler:
         if not torch.isfinite(x).all().item():
             raise ValueError('Input tensor contains NaN or infinite value(s).')
 
-    '''
-    Build any private functions
-    '''
+    # --- Private Functions ---
 
     def _build_bound_tensor(self):
         min_vals = []
@@ -459,9 +441,7 @@ class FeatureScaler:
         mask = (x_check > self._presence_min_values).all(dim=-1)
         return mask       
 
-    '''
-    Main class functions
-    '''
+    # --- Public Functions ---
     
     def train_scale(self, x: torch.Tensor) -> [torch.Tensor, dict] :
         # validate
@@ -506,14 +486,13 @@ class FeatureScaler:
             x_scale[:, self.scaling_masks[mode]] = scaler.transform(x_scale[:, self.scaling_masks[mode]])
             
         x[presence_mask] = x_scale
-        return x
-                
+        return x          
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         self._validate_input(x)
         x = x.clone()
 
-        #NOTE: check this, if presence feature is scaled, now min_value has changed...
+        #TODO: check this, if presence feature is scaled, now min_value has changed...
         presence_mask = self._build_presence_mask(x).to(self.device)
         x_inv = x[presence_mask]
 

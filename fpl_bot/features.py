@@ -67,9 +67,7 @@ class Features:
         self.type_masks = self._build_type_mask()           # builds tensor, a mask for each feature type, shape = [ n_features]
         self.temporal_mask = self._temporal_mask()          # builds tensor, a temporal mask, True is tempooral, shape = [n_features]
     
-    '''
-    Validate initialisation
-    '''
+    # --- Validation ---
 
     def _validate(self):
         # validate input
@@ -103,9 +101,7 @@ class Features:
                 if s.min_value is None:
                     raise ValueError(f"{s.name} requires min_value to be presence check")
 
-    '''
-    Basic Properties
-    '''
+    # --- Propterties ---
 
     @property
     def names(self):
@@ -115,9 +111,7 @@ class Features:
     def specs_by_mode(self):
         return {mode: [s for s in self.specs if s.scaling_mode == mode] for mode in ScalingMode}
 
-    '''
-    Generate masks
-    '''
+    # --- Helper Functions ---
 
     def _temporal_mask(self):
         # build mask for temporal features, none temporal is inverse
@@ -143,17 +137,11 @@ class Features:
             )
         return masks
 
-    '''
-    Useful functions
-    '''
+    # --- Public Functions and Methods ---
 
     def __len__(self):
         # return number of features
         return len(self.specs)  
-
-    '''
-    Load or Output feature dict
-    '''
 
     def to_dict(self):
         return [
