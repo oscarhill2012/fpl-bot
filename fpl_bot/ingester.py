@@ -1,6 +1,7 @@
 import pandas as pd
 import logging
 from dataclasses import dataclass
+from typing import Callable 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -125,7 +126,7 @@ class FPLSourceConfig:
     other_games: bool                           # if dataset contains non-EPL matches, is True
     gw_col: str | None                          # which col has the GW number
     gw_path: str | None                         # path pattern for per-GW files
-    transform: dict[str, callable[[str], any]]  # transform feature
+    transform: dict[str, Callable[[str], any]]  # transform feature
 
 
 class GameweekProvider:
@@ -150,10 +151,12 @@ class GameweekProvider:
 
         # generate columns of cumulative data
         # map between per_90 and cumulative, and visa versa
-        self._cum_map = self._generate_cumulative_map()
-        self._cum_rev = self._invert_dict(self._cum_map)
+        self.cum_map = self._generate_cumulative_map()
+        self.cum_rev = self._invert_dict(self.cum_map)
+
         # minutes should be in cumulative map, but isnt a per_90 so have to add manually
-        self._cum_map["minutes"] = "cum_minutes"
+        self.cum_map["minutes"] = "cum_minutes"
+
         # initialise internal state to store points of previous week
         self._prev_points = None
     
@@ -180,6 +183,13 @@ class GameweekProvider:
             for key, value in dictionary.items()
         }
     
+    @staticmethod
+    def _player_team_index(df: pd.DataFrame) -> pd.Series:
+        """
+        Composite index: "{player_code}_{team_code}"
+        """
+        return df["player_code"].astype(int).astype(str) + "_" + df["team_code"].astype(int).astype(str)
+
     def _match_identifier(self, df: pd.DataFrame, identifier: dict[str, str]) -> pd.DataFrame:
         """
         Selects rows from data frame that, satisfy;
@@ -224,7 +234,7 @@ class GameweekProvider:
         
         return df.reset_index(), snapshot_features
 
-    def _update_cumulative_frame(self, df: pd.DataFrame, output_cols: list[str]):
+    def _update_cumulative_frame(self, df: pd.DataFrame, output_cols: list[str]) -> "GameweekProvider":
         """
         Updates cumulative state dataframe, 
         with df no cumulative tally or by addition if is,
@@ -232,12 +242,12 @@ class GameweekProvider:
         Returns:- updated cumulative dataframe state
         """
         # populate cumulative df if none exists, else add to existing df
-        # cummulative df has columns given by _cum_map
+        # cummulative df has columns given by cum_map
         if self.cumulative_df is None:
-            self.cumulative_df = df[output_cols].rename(columns=self._cum_map).copy()
+            self.cumulative_df = df[output_cols].rename(columns=self.cum_map).copy()
         else:
             # extract last total points to difference
-            self.cumulative_df = self.cumulative_df.add(df[output_cols].rename(columns=self._cum_map), fill_value = 0.0)
+            self.cumulative_df = self.cumulative_df.add(df[output_cols].rename(columns=self.cum_map), fill_value = 0.0)
 
         return self
 
@@ -247,8 +257,8 @@ class GameweekProvider:
         Returns:- dataframe of same shape as input
         """
         df.loc[mask, features] = (
-            self.cumulative_df.loc[mask, self._cum_rev.keys()]
-            .rename(columns=self._cum_rev)
+            self.cumulative_df.loc[mask, self.cum_rev.keys()]
+            .rename(columns=self.cum_rev)
             .div(self.cumulative_df.loc[mask, "cum_minutes"] / 90, axis=0)
         )
         return df
@@ -268,6 +278,11 @@ class GameweekProvider:
         - processes
         - calculates any per_90 feature if config sets output to contain "per_90"
         - stores cumulative tally privately and outputs df
+        Outputs:
+                - df with columns of cfg.col_map.values(), plus player_code, 
+                  tean_code and indexed by player_team joint index
+        
+        NOTE: importantly this allows player already in league joining new team to be considered a "new entity"
         """
         # load df
         if self.cfg.stacked:
@@ -314,7 +329,8 @@ class GameweekProvider:
             .reset_index()                                          # reset index from .groupby      
             .merge(self.cfg.id_map, on="player_id", how="right")    # add all players (including those who didnt play),
             .fillna(0.0)                                            # setting all stats 0 if they didn't feature
-            .set_index("player_code")                               # index by player code
+            .assign(player_team_id=self._player_team_index)         # adds column "{player_code}_{team_code}"
+            .set_index("player_team_id")                            # indexes by new composite index column
             .filter(items=output_cols)                              # select only output columns
             .astype(float)                                          # cast all columns as float, player_code safe as index
         )
@@ -330,8 +346,9 @@ class GameweekProvider:
 
         # per_90_ify and for rows of df where minutes != 0, this implies cum =! 0 by definition
         per_90_features = [v for v in output_cols if "per_90" in v]
-        # only per_90ify if minutes not 0, else div by 0
-        mask = df["minutes"] > 0.0
+        # only per_90ify if minutes not 0, 
+        # uses cumulative df to carry forward players per_90 rates even if they did no feature in gw
+        mask = self.cumulative_df["cum_minutes"] > 0.0
         
         if per_90_features and mask.any():
             df = self._calculate_per_90(df, mask, per_90_features)
@@ -360,7 +377,7 @@ class Ingester:
         self.opta_provider = GameweekProvider(opta_config, season_root)
         self.player_gw_stats: dict[int, pd.DataFrame] = {}
         self.player_cumulative_stats: dict[int, pd.DataFrame] = {}
-        self.first_gw: dict[int, int] = {}
+        self.first_gw: dict[str, int] = {}
 
     # --- Helper Functions ---
 
@@ -395,7 +412,7 @@ class Ingester:
             self.fpl_provider.cumulative_df, 
             self.opta_provider.cumulative_df,
         )
-        self._update_first_gw(gw_combined[gw], gw)
+        self._update_first_gw(gw_combined, gw)
         return gw_combined, gw_cum_combined
 
     # --- Public Functions ---

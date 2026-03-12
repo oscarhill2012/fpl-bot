@@ -22,7 +22,7 @@ class PriorData:
     # --- Public Functions & Methods ---
     
     def to_json(self, path: str):
-        with open(path + f"GW{self.meta_data['latest_gw']}_priors.json", "w") as f:
+        with open(path + f"priors.json", "w") as f:
             json.dump(self.__dict__, f)
 
     @classmethod
@@ -82,8 +82,8 @@ class PriorComputer:
             if col not in self.snapshot_cols
         ]
 
-        if "player_id" in player_meta.columns:
-            self.player_meta = player_meta.set_index("player_code")
+        if player_meta.index.name != "player_team_id":
+            self.player_meta = player_meta.set_index("player_team_id")
         else: 
             self.player_meta = player_meta
 
@@ -98,8 +98,8 @@ class PriorComputer:
         if self.cumulative.keys() != self.player_data.keys():
             raise RuntimeError("Inconsistent no. of GWs entered into compute priors")
         for key in self.cumulative.keys():
-            if (self.cumulative[key].index.name != "player_code") or (self.player_data[key].index.name != "player_code"):
-                raise TypeError("compute_priors() requires index is player_code for all df")
+            if (self.cumulative[key].index.name != "player_team_id") or (self.player_data[key].index.name != "player_team_id"):
+                raise TypeError("compute_priors() requires index is player_team_id for all df")
 
     # --- Private helpers ---
 
@@ -116,7 +116,7 @@ class PriorComputer:
             if not col in df.columns:
                 raise ValueError("All cat_cols must be columns in DataFrame")
                 
-            df[col]= df[col].astype("categorical")
+            df[col]= df[col].astype("category")
         
         return df
 
@@ -159,7 +159,7 @@ class PriorComputer:
             .sum()
         )
 
-    def _normalise_weighted_sums(self, df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    def _normalise_weighted_sums(self, df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:    
         """
         WARNING: mutates input, provide copy to avoid
         Leaving group_cols empty, groups by index
@@ -199,7 +199,7 @@ class PriorComputer:
         """
         Compute priors for given level, defined by group cols.
         Args: 
-            - group_cols: defines level, if None groups by index ("player_code") 
+            - group_cols: defines level, if None groups by index ("player_team_id") 
             - input_df:   reads df from state or can receive df as parameter
         """
         # copy dataframe, so no mutation
@@ -242,7 +242,7 @@ class PriorComputer:
         combined = pd.concat([per_90_df, snapshots, cum_df["cum_minutes"]], axis=1)
 
         # output dict
-        return self._output_df_toDict(combined)
+        return self._output_df_to_dict(combined)
 
     # --- Public Functions ---
 
@@ -251,8 +251,8 @@ class PriorComputer:
         self.totals = self._extract_totals()
 
         # calculate position, position_team and individual
-        position = self._compute_level(group_cols=["position"], minutes_threshold=self.min_mins)
-        pos_team = self._compute_level(group_cols=["position", "team"], minutes_threshold=self.min_mins)
+        position = self._compute_level(group_cols=["position"])
+        pos_team = self._compute_level(group_cols=["position", "team_code"])
         players = self._compute_level(minutes_threshold=self.min_mins)
 
         # add league groupby col and calculate league prior
