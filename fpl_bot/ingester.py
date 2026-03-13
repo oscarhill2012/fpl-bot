@@ -150,12 +150,14 @@ class GameweekProvider:
             self._stacked_data = pd.read_csv(self.season_root + self.cfg.gw_path)
 
         # generate columns of cumulative data
-        # map between per_90 and cumulative, and visa versa
+        # map between per_90 and cumulative
         self.cum_map = self._generate_cumulative_map()
-        self.cum_rev = self._invert_dict(self.cum_map)
 
-        # minutes should be in cumulative map, but isnt a per_90 so have to add manually
+        # minutes and featured should be in cumulative map, but aren't labelled per_90 so have to add manually
         self.cum_map["minutes"] = "cum_minutes"
+        self.cum_map["featured"] = "cum_featured"
+
+        self.cum_rev = self._invert_dict(self.cum_map)
 
         # initialise internal state to store points of previous week
         self._prev_points = None
@@ -213,6 +215,13 @@ class GameweekProvider:
 
         return df
 
+    def _add_featured_col(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Adds featured = 1, if mins > 0
+        """
+        df["featured"] = (df["minutes"] > 0).astype(int)
+        return df
+    
     def _separate_snapshot_cols(self, df: pd.DataFrame, identity_col: str, cum_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Seperate any already snapshot features from df,
@@ -234,7 +243,7 @@ class GameweekProvider:
         
         return df.reset_index(), snapshot_features
 
-    def _update_cumulative_frame(self, df: pd.DataFrame, output_cols: list[str]) -> "GameweekProvider":
+    def _update_cumulative_frame(self, df: pd.DataFrame, cum_cols: list[str]) -> "GameweekProvider":
         """
         Updates cumulative state dataframe, 
         with df no cumulative tally or by addition if is,
@@ -244,16 +253,18 @@ class GameweekProvider:
         # populate cumulative df if none exists, else add to existing df
         # cummulative df has columns given by cum_map
         if self.cumulative_df is None:
-            self.cumulative_df = df[output_cols].rename(columns=self.cum_map).copy()
+            self.cumulative_df = df[cum_cols].rename(columns=self.cum_map).copy()
         else:
             # extract last total points to difference
-            self.cumulative_df = self.cumulative_df.add(df[output_cols].rename(columns=self.cum_map), fill_value = 0.0)
+            self.cumulative_df = self.cumulative_df.add(df[cum_cols].rename(columns=self.cum_map), fill_value = 0.0)
 
         return self
 
     def _calculate_per_90(self, df: pd.DataFrame, mask: pd.Series, features: list[str]) -> pd.DataFrame:
         """
-        Calculate per_90 rates for features if mask is True for row.
+        Updates per_90 calculation for any feature masked as True (accumulted minutes != 0)
+        Intentionally recalulates for players with minutes=0 for a given gw,
+        as this is quicker than backfilling empty rows after the fact.
         Returns:- dataframe of same shape as input
         """
         df.loc[mask, features] = (
@@ -289,7 +300,7 @@ class GameweekProvider:
             # returns a view, so copy
             df = self._stacked_data[self._stacked_data[self.cfg.gw_col] == gw].copy()
         else:    
-            df = pd.read_csv(self.season_root + f"/GW{gw}/playermatchstats.csv")
+            df = pd.read_csv(self.season_root + f"/playermatchstats.csv")
         
         # guard: checks all features of col_map are in dataset
         missing = set(self.cfg.col_map.keys()) - set(df.columns)
@@ -311,6 +322,10 @@ class GameweekProvider:
 
         # guard: coerce all output columns to numeric (real data may have string-typed floats)
         df = self._force_numeric_cols(df, output_cols)
+
+        # featured = 1 if player has mins > 0, this will useful for averaging in priors
+        df = self._add_featured_col(df)
+        output_cols.append("featured")
 
         # does df contain snapshot features
         if self.cfg.snapshot_cols:     
@@ -342,16 +357,16 @@ class GameweekProvider:
                 for col, func in self.cfg.transform.items() if col in df.columns
             })
 
-        self._update_cumulative_frame(df, output_cols)
+        rate_cols  = [v for v in self.cum_map.keys()]
+        self._update_cumulative_frame(df, rate_cols)
 
-        # per_90_ify and for rows of df where minutes != 0, this implies cum =! 0 by definition
-        per_90_features = [v for v in output_cols if "per_90" in v]
-        # only per_90ify if minutes not 0, 
-        # uses cumulative df to carry forward players per_90 rates even if they did no feature in gw
+        # only per_90ify if minutes not 0, no div by 0
+        # uses cumulative df to carry forward players per_90 rates even if they did no feature in gw          
+        per_90_cols = [v for v in output_cols if "per_90" in v]
         mask = self.cumulative_df["cum_minutes"] > 0.0
         
-        if per_90_features and mask.any():
-            df = self._calculate_per_90(df, mask, per_90_features)
+        if per_90_cols and mask.any():
+            df = self._calculate_per_90(df, mask, per_90_cols)
 
         return df
         
@@ -379,11 +394,15 @@ class Ingester:
         self.player_cumulative_stats: dict[int, pd.DataFrame] = {}
         self.first_gw: dict[str, int] = {}
 
+        self.cum_rev_map = {**self.fpl_provider.cum_rev, **self.opta_provider.cum_rev}
+
     # --- Helper Functions ---
 
-    def _merge_dfs(self, fpl: pd.DataFrame, opta: pd.DataFrame) -> pd.DataFrame:
-        # remove any columns from opta that overlap with fpl
-        # NOTE: we prioritise fpl data, when tested minutes differed to 5% in opta but else consistent
+    def _combine_dfs(self, fpl: pd.DataFrame, opta: pd.DataFrame) -> pd.DataFrame:
+        """
+        remove any columns from opta that overlap with fpl, and combine
+        NOTE: we prioritise fpl data, when tested minutes differed to 5% in opta but else consistent
+        """
         overlap = fpl.columns.intersection(opta.columns)
         opta = opta.drop(columns=overlap, errors="ignore")
         return pd.concat([fpl, opta], axis=1)
@@ -403,12 +422,12 @@ class Ingester:
 
     def _process_gw(self, gw: int):
         # uses instances of GameweekProvider to load gw
-        gw_combined = self._merge_dfs(
+        gw_combined = self._combine_dfs(
             self.fpl_provider.load_gameweek(gw), 
             self.opta_provider.load_gameweek(gw),
         )
         # extracts cumulative tally attribute from GameweekProvider instance
-        gw_cum_combined = self._merge_dfs(
+        gw_cum_combined = self._combine_dfs(
             self.fpl_provider.cumulative_df, 
             self.opta_provider.cumulative_df,
         )

@@ -34,14 +34,14 @@ class PriorData:
     @classmethod
     def from_data(
         cls,
-        cumulative: dict[int, pd.DataFrame],
         player_data: dict[int, pd.DataFrame],
+        cumulative: dict[int, pd.DataFrame],
         player_meta: pd.DataFrame,
         cum_rev_map: dict[str, str],
         min_mins: float = 450.0,
     ) -> 'PriorData':
         """Convenience constructor - delegates to PriorComputer."""
-        return PriorComputer(cumulative, player_data, player_meta, cum_rev_map, min_mins).compute()
+        return PriorComputer(player_data, cumulative, player_meta, cum_rev_map, min_mins).compute()
 
 
 class PriorComputer:
@@ -61,8 +61,8 @@ class PriorComputer:
 
     def __init__(
         self,
-        cumulative: dict[int, pd.DataFrame],
         player_data: dict[int, pd.DataFrame],
+        cumulative: dict[int, pd.DataFrame],
         player_meta: pd.DataFrame,
         cum_rev_map: dict[str, str],
         min_mins: float = 450.0,
@@ -72,6 +72,8 @@ class PriorComputer:
         
         self.cum_rev_map = cum_rev_map      
         self.min_mins = min_mins
+        self._validate_input()
+
         self.latest_gw = max(cumulative.keys())
         self.snapshot_cols = [                                  # snapshot featues
             col for col in player_data[self.latest_gw].columns 
@@ -89,8 +91,6 @@ class PriorComputer:
 
         # populated during compute()
         self.totals: pd.DataFrame | None = None
-
-        self._validate_input()
 
     # --- Validation ---
 
@@ -134,6 +134,18 @@ class PriorComputer:
         )
 
     @staticmethod
+    def _variance_of_ratio(df: pd.DataFrame, group: dict, numerator: str, denominator: str) -> pd.Series:
+        """
+        Calulates variance for ratio of two ratio_cols.
+        NOTE: second col is numerator
+        WARNING: only call if group not {"level": 0}
+        """
+        ratio = df[group["by"] + [numerator, denominator]]
+        ratio["ratio"]= df[numerator] / df[denominator]
+        
+        return ratio.groupby(**group)["ratio"].std().fillna(0.0)
+
+    @staticmethod
     def _output_df_to_dict(priors: pd.DataFrame) -> dict[str, dict[str, float]]:
         """
         convert df of prior computation results to dict, 
@@ -159,20 +171,22 @@ class PriorComputer:
             .sum()
         )
 
-    def _normalise_weighted_sums(self, df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:    
+    def _normalise_weighted_sums(self, df: pd.DataFrame, group: dict) -> pd.DataFrame:    
         """
         WARNING: mutates input, provide copy to avoid
         Leaving group_cols empty, groups by index
         """
-        df = self._coerce_categorical_cols(df, group_cols)
-
-        # load to dict for ease
-        group = {"by": group_cols, "observed": False} if group_cols else {"level": 0}
-
         # calculate weighted (minutes) average per group, group first for efficency
-        grouped = df.groupby(**group).sum()
-
-        return self._per_90_calculation(grouped)
+        grouped = (
+            df
+            .groupby(**group)
+            .sum()
+        )
+        return (
+            grouped[self.snapshot_cols]
+            .div(grouped["cum_minutes"], axis=0)
+            .replace([np.inf, -np.inf, np.nan], 0.0)
+        )
         
     def _extract_totals(self) -> pd.DataFrame:
         """
@@ -212,8 +226,9 @@ class PriorComputer:
         if not group_cols:
             group_cols = []
 
-        # filter below threshold minutes
+        # filter above threshold minutes and featured (games involved in)
         df = df[df["cum_minutes"] > minutes_threshold]
+        df = df[df["cum_featured"] > 0]
 
         # rate columns
         rate_cols = [col for col in df.columns if "cum_" in col]
@@ -221,12 +236,17 @@ class PriorComputer:
         if group_cols:
             # forces pandas to calculate each permutation, even if no data
             df = self._coerce_categorical_cols(df, group_cols)
-
             # load to dict for ease
             group = {"by": group_cols, "observed": False} 
         else: 
             group = {"level": 0}
         
+        # find variance of (cum_minutes / cum_features), as measure of priors predictive accuracy
+        if group_cols:    
+            ratio_var = self._variance_of_ratio(df, group, "cum_minutes", "cum_featured")
+        else: 
+            ratio_var = 0.0
+
         # find per_90 averages for groups
         cum_df = (
             df[rate_cols + group_cols]
@@ -236,10 +256,19 @@ class PriorComputer:
         per_90_df = self._per_90_calculation(cum_df)
 
         # find weighted averages of snapshot features
-        snapshots = self._normalise_weighted_sums(df[self.snapshot_cols + ["cum_minutes"] + group_cols], group_cols)
+        snapshots = self._normalise_weighted_sums(df, group)
         
+        # add average minutes per time featured in game, as an uneducated guess at minutes, 
+        # this will be refined with MinutesEstimator
+        cum_df["minutes"] = (
+            cum_df["cum_minutes"]
+            .div(cum_df["cum_featured"], axis=0)
+            .replace([np.inf, -np.inf, np.nan], 0.0)
+        )
+        cum_df["mins_over_featured_var"] = ratio_var 
+
         # join snapshot and rate calculations
-        combined = pd.concat([per_90_df, snapshots, cum_df["cum_minutes"]], axis=1)
+        combined = pd.concat([per_90_df, snapshots, cum_df[["minutes", "mins_over_featured_var"]]], axis=1)
 
         # output dict
         return self._output_df_to_dict(combined)
