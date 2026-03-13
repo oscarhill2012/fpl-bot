@@ -1,3 +1,4 @@
+from __future__ import annotations
 import pandas as pd
 import numpy as np
 import logging
@@ -22,11 +23,11 @@ class PriorData:
     # --- Public Functions & Methods ---
     
     def to_json(self, path: str):
-        with open(path + f"priors.json", "w") as f:
+        with open(path + f"/priors.json", "w") as f:
             json.dump(self.__dict__, f)
 
     @classmethod
-    def from_json(cls, path: str, filename: str) -> 'PriorData':
+    def from_json(cls, path: str, filename: str) -> "PriorData":
         with open(path + filename, "r") as f:
             data = json.load(f)
         return cls(**data)
@@ -34,14 +35,16 @@ class PriorData:
     @classmethod
     def from_data(
         cls,
+        features: Features,
         player_data: dict[int, pd.DataFrame],
         cumulative: dict[int, pd.DataFrame],
         player_meta: pd.DataFrame,
-        cum_rev_map: dict[str, str],
         min_mins: float = 450.0,
-    ) -> 'PriorData':
-        """Convenience constructor - delegates to PriorComputer."""
-        return PriorComputer(player_data, cumulative, player_meta, cum_rev_map, min_mins).compute()
+    ) -> "PriorData":
+        """
+        Convenience constructor - delegates to PriorComputer.
+        """
+        return PriorComputer(features, player_data, cumulative, player_meta, min_mins).compute()
 
 
 class PriorComputer:
@@ -51,6 +54,7 @@ class PriorComputer:
     Uses max(cumulative.keys()) as the latest available snapshot.
 
     Args:
+        features:     global features registry 
         cumulative:   from ingester, raw cumulative counts per (player, gw)
         player_data:  from ingester, per-GW features and per-90 rates
         player_meta:  DataFrame with [player_code, position, team_code]
@@ -61,30 +65,27 @@ class PriorComputer:
 
     def __init__(
         self,
+        features: Features, 
         player_data: dict[int, pd.DataFrame],
         cumulative: dict[int, pd.DataFrame],
         player_meta: pd.DataFrame,
-        cum_rev_map: dict[str, str],
         min_mins: float = 450.0,
     ):
         self.cumulative = cumulative
         self.player_data = player_data
-        
-        self.cum_rev_map = cum_rev_map      
         self.min_mins = min_mins
+        self.latest_gw = max(cumulative.keys())
+
         self._validate_input()
 
-        self.latest_gw = max(cumulative.keys())
-        self.snapshot_cols = [                                  # snapshot featues
-            col for col in player_data[self.latest_gw].columns 
-            if "per_90" not in col and "minutes" not in col
-            ]
-        self.per_90_cols = [                                    # per_90 features
-            col for col in player_data[self.latest_gw].columns 
-            if col not in self.snapshot_cols
-        ]
+        self.features = features
+        self.cumulative_cols = features.cumulative_columns
+        self.per_90_cols = features.per_90_columns
+        self.snapshot_cols = features.snapshot_columns
+        self.cum_rev_map = features.inv_cumulative_map
 
         if player_meta.index.name != "player_team_id":
+            player_meta["player_team_id"] = self._player_team_index(player_meta)
             self.player_meta = player_meta.set_index("player_team_id")
         else: 
             self.player_meta = player_meta
@@ -102,6 +103,13 @@ class PriorComputer:
                 raise TypeError("compute_priors() requires index is player_team_id for all df")
 
     # --- Private helpers ---
+
+    @staticmethod
+    def _player_team_index(df: pd.DataFrame) -> pd.Series:
+        """
+        Composite index: "{player_code}_{team_code}"
+        """
+        return df["player_code"].astype(int).astype(str) + "_" + df["team_code"].astype(int).astype(str)
 
     @staticmethod
     def _coerce_categorical_cols(df: pd.DataFrame, cat_cols: list) -> pd.DataFrame:
@@ -126,7 +134,7 @@ class PriorComputer:
         also maps cumulative columns names to per_90 columns with cum_rev_map
         """
         return (
-            cum_df
+            cum_df[self.per_90_cols]
             .drop("cum_minutes", axis=1)
             .div(cum_df["cum_minutes"] / 90, axis=0)
             .replace([np.inf, -np.inf, np.nan], 0.0)
@@ -140,7 +148,7 @@ class PriorComputer:
         NOTE: second col is numerator
         WARNING: only call if group not {"level": 0}
         """
-        ratio = df[group["by"] + [numerator, denominator]]
+        ratio = df[group["by"] + [numerator, denominator]].copy()
         ratio["ratio"]= df[numerator] / df[denominator]
         
         return ratio.groupby(**group)["ratio"].std().fillna(0.0)
@@ -230,9 +238,6 @@ class PriorComputer:
         df = df[df["cum_minutes"] > minutes_threshold]
         df = df[df["cum_featured"] > 0]
 
-        # rate columns
-        rate_cols = [col for col in df.columns if "cum_" in col]
-
         if group_cols:
             # forces pandas to calculate each permutation, even if no data
             df = self._coerce_categorical_cols(df, group_cols)
@@ -249,11 +254,11 @@ class PriorComputer:
 
         # find per_90 averages for groups
         cum_df = (
-            df[rate_cols + group_cols]
+            df
             .groupby(**group)
             .sum()
         )
-        per_90_df = self._per_90_calculation(cum_df)
+        per_90 = self._per_90_calculation(cum_df)
 
         # find weighted averages of snapshot features
         snapshots = self._normalise_weighted_sums(df, group)
@@ -268,20 +273,23 @@ class PriorComputer:
         cum_df["mins_over_featured_var"] = ratio_var 
 
         # join snapshot and rate calculations
-        combined = pd.concat([per_90_df, snapshots, cum_df[["minutes", "mins_over_featured_var"]]], axis=1)
+        combined = pd.concat([per_90, snapshots, cum_df[["minutes", "mins_over_featured_var"]]], axis=1)
+
+        # ensure combined has columns ordered by convention
+        combined = combined[self.features.output_columns]
 
         # output dict
         return self._output_df_to_dict(combined)
 
     # --- Public Functions ---
 
-    def compute(self) -> PriorData:
+    def compute(self) -> "PriorData":
         """Main entry point — orchestrates the full pipeline."""
         self.totals = self._extract_totals()
 
         # calculate position, position_team and individual
         position = self._compute_level(group_cols=["position"])
-        pos_team = self._compute_level(group_cols=["position", "team_code"])
+        pos_team = self._compute_level(group_cols=["position", "team_code"])    # NOTE: position team ordering is convention
         players = self._compute_level(minutes_threshold=self.min_mins)
 
         # add league groupby col and calculate league prior
@@ -300,8 +308,8 @@ class PriorComputer:
                 "min_minutes": self.min_mins,
                 "n_players_tot": len(self.player_meta),
                 "n_player_mins_req": len(players),
-                "snapshot_cols": self.snapshot_cols,
-                "per_90_cols": self.per_90_cols,
+                "snapshot_cols": self.features.snapshot_columns,
+                "per_90_cols": self.features.per_90_columns,
             }
         )
 

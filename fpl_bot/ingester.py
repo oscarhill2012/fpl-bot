@@ -1,114 +1,11 @@
+from __future__ import annotations
+from .features import Features, FeatureSpec, DataSource
 import pandas as pd
 import logging
 from dataclasses import dataclass
 from typing import Callable 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-opta_map = {
-    # Unchanged
-    "minutes_played":           "minutes",
-
-    # Attack
-    "total_shots":              "shots_per_90",
-    "xgot":                     "xgot_per_90",
-    "shots_on_target":          "shots_on_target_per_90",
-    "big_chances_missed":       "big_chances_missed_per_90",
-    "chances_created":          "chances_created_per_90",
-    "touches_opposition_box":   "touches_opposition_box_per_90",
-
-    # Passing
-    "accurate_passes":          "accurate_passes_per_90",
-    "final_third_passes":       "final_third_passes_per_90",
-    "accurate_crosses":         "accurate_crosses_per_90",
-    "accurate_long_balls":      "accurate_long_balls_per_90",
-
-    # Possession
-    "touches":                  "touches_per_90",
-    "successful_dribbles":      "successful_dribbles_per_90",
-
-    # Defence
-    "tackles":                  "tackles_per_90",
-    "interceptions":            "interceptions_per_90",
-    "recoveries":               "recoveries_per_90",
-    "blocks":                   "blocks_per_90",
-    "clearances":               "clearances_per_90",
-    "headed_clearances":        "headed_clearances_per_90",
-    "dribbled_past":            "dribbled_past_per_90",
-
-    # Duels
-    "duels_won":                "duels_won_per_90",
-    "duels_lost":               "duels_lost_per_90",
-    "ground_duels_won":         "ground_duels_won_per_90",
-    "aerial_duels_won":         "aerial_duels_won_per_90",
-
-    # Discipline / Other
-    "was_fouled":               "was_fouled_per_90",
-    "fouls_committed":          "fouls_committed_per_90",
-
-    # GK
-    "xgot_faced":               "xgot_faced_per_90",
-    "goals_prevented":          "goals_prevented_per_90",
-    "sweeper_actions":          "sweeper_actions_per_90",
-    "high_claim":               "high_claim_per_90",
-    "gk_accurate_passes":       "gk_accurate_passes_per_90",
-    "gk_accurate_long_balls":   "gk_accurate_long_balls_per_90",
-}
-
-vaastav_map = {
-    "minutes":                      "minutes",
-    "starts":                       "starts",
-    "value":                        "price",
-    "total_points":                 "points",
-    "transfers_in":                 "transfers_in",
-    "transfers_out":                "transfers_out",
-    "goals_scored":                 "goals_per_90",
-    "assists":                      "assists_per_90",
-    "clean_sheets":                 "clean_sheets_per_90",
-    "goals_conceded":               "goals_conceded_per_90",
-    "yellow_cards":                 "yellow_cards_per_90",
-    "saves":                        "saves_per_90",
-    "bonus":                        "bonus_per_90",
-    "bps":                          "bps_per_90",
-    "influence":                    "influence_per_90",
-    "creativity":                   "creativity_per_90",
-    "threat":                       "threat_per_90",
-    "ict_index":                    "ict_index_per_90",
-    "expected_goals":               "expected_goals_per_90",
-    "expected_assists":             "expected_assists_per_90",
-    "expected_goal_involvements":   "expected_goal_involvements_per_90",
-    "expected_goals_conceded":      "expected_goals_conceded_per_90",
-}
-
-fci_map = {
-    "minutes":                      "minutes",
-    "starts":                       "starts",
-    "now_cost":                     "price",
-    "event_points":                 "points",
-    "transfers_in":                 "transfers_in",
-    "transfers_out":                "transfers_out",
-    "goals_scored":                 "goals_per_90",
-    "assists":                      "assists_per_90",
-    "clean_sheets":                 "clean_sheets_per_90",
-    "goals_conceded":               "goals_conceded_per_90",
-    "yellow_cards":                 "yellow_cards_per_90",
-    "saves":                        "saves_per_90",
-    "bonus":                        "bonus_per_90",
-    "bps":                          "bps_per_90",
-    "influence":                    "influence_per_90",
-    "creativity":                   "creativity_per_90",
-    "threat":                       "threat_per_90",
-    "ict_index":                    "ict_index_per_90",
-    "expected_goals":               "expected_goals_per_90",
-    "expected_assists":             "expected_assists_per_90",
-    "expected_goal_involvements":   "expected_goal_involvements_per_90",
-    "expected_goals_conceded":      "expected_goals_conceded_per_90",
-}
-
-vaastav_transform = {
-    "price": lambda x: x/10,
-}
 
 @dataclass
 class FPLSourceConfig:
@@ -117,10 +14,10 @@ class FPLSourceConfig:
     all output columns required must be in map (bar defaults), even if no transform,
     any defaults will be added to map automatically
     """
+    provider: DataSource                        # data providers tag, "vaastav", "fci", "opta"
     col_map: dict[str, str]                     # source_col → output columns (should contain all columns even if no change)
     player_id: dict[str, str]                   # maps player_id tag in dataset to "player_id"
     id_map: pd.DataFrame                        # dataframe that contains id inrelation to player code
-    snapshot_cols: list[str] | None             # list of features that shouldn't be accumulated
     stacked: bool                               # one big file vs per-GW files
     denotes_epl: dict[str, str]                 # verifies data from epl match: {indentifying feature: identifying string}
     other_games: bool                           # if dataset contains non-EPL matches, is True
@@ -138,9 +35,11 @@ class GameweekProvider:
     """
     def __init__(
         self, 
+        features: Features,
         config: FPLSourceConfig,
         season_root: str,
     ):
+        self.features = features
         self.cfg = config
         self.season_root = season_root
         self.cumulative_df = None
@@ -149,41 +48,26 @@ class GameweekProvider:
         if self.cfg.stacked:
             self._stacked_data = pd.read_csv(self.season_root + self.cfg.gw_path)
 
-        # generate columns of cumulative data
-        # map between per_90 and cumulative
-        self.cum_map = self._generate_cumulative_map()
+        # generate column mapping dicts
+        self.cum_map = features.cumulative_map_for(config.provider)
+        self.cum_rev = features.inv_cumulative_map_for(config.provider)      
 
-        # minutes and featured should be in cumulative map, but aren't labelled per_90 so have to add manually
-        self.cum_map["minutes"] = "cum_minutes"
-        self.cum_map["featured"] = "cum_featured"
+        # generate snapshot, cumulative and output column names for provider
+        self.snapshot_cols = features.snapshot_columns_for(self.cfg.provider)
+        self.cumulative_cols = features.cumulative_columns_for(self.cfg.provider)
+        self.output_cols = list(self.cfg.col_map.values())
 
-        self.cum_rev = self._invert_dict(self.cum_map)
+        # we add featured column, we want it to be cumulative (but not per_90) and be outputted
+        self.output_cols.append("featured")
+        self.cumulative_cols.append("featured")
+
+        # columns that will get per_90 rate (subtly different to cumulative_cols as these contain "minutes")
+        self.per_90_cols = features.per_90_cols_for(self.cfg.provider)
 
         # initialise internal state to store points of previous week
         self._prev_points = None
     
     # --- Helper Functions ----
-
-    def _generate_cumulative_map(self) -> dict[str, str]:
-        """
-        any feature that becomes per_90, needs to be accumulated to state,
-        as per_90 = (cumulative total / cumulative minutes) * 90.
-        This function generate dict to map per_90 feature names to cumulative "cum_feature".
-        """
-        return {
-            per_90: "cum_" + per_90.replace("_per_90", "")
-            for per_90 in self.cfg.col_map.values() 
-            if "per_90" in per_90   
-        }
-
-    def _invert_dict(self, dictionary: dict[any, any]) -> dict[any, any]:
-        """
-        Swaps keys and values of a dict
-        """
-        return {
-            value: key
-            for key, value in dictionary.items()
-        }
     
     @staticmethod
     def _player_team_index(df: pd.DataFrame) -> pd.Series:
@@ -208,10 +92,12 @@ class GameweekProvider:
         Forces all cols in df to numeric.
         Returns:- df of same shape as input
         """
-        # ensure we only use columns that exist in df
-        cols_to_coerce = [c for c in cols if c in df.columns]
+        missing = set(cols) - set(df.columns)
+        if missing:
+            raise ValueError(f"Cannot coerce column not in df, {missing} is not")
+
         # make columns numeric, if can't make 0.0
-        df[cols_to_coerce] = df[cols_to_coerce].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        df[cols] = df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
         return df
 
@@ -222,7 +108,7 @@ class GameweekProvider:
         df["featured"] = (df["minutes"] > 0).astype(int)
         return df
     
-    def _separate_snapshot_cols(self, df: pd.DataFrame, identity_col: str, cum_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def _separate_snapshot_cols(self, df: pd.DataFrame, identity_col: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Seperate any already snapshot features from df,
         Expect more than one row per indentity.
@@ -231,19 +117,19 @@ class GameweekProvider:
         Returns:- df without snapshot columns
                 - snapshot columns indexed by identity
         """
+
         if "kickoff_time" in df.columns:
             # kickoff time is iso string, to_datetime handles that
             df['kickoff_time'] = pd.to_datetime(df['kickoff_time'])
             # most recent game is now last row per id 
             df = df.sort_values("kickoff_time")
         
-        # last row is most up-to-date
-        snapshot_features = df.groupby(identity_col)[cum_cols].last()
-        df = df.drop(columns=cum_cols)
-        
+        snapshot_features = df.groupby(identity_col)[self.snapshot_cols].last()
+        df = df.drop(columns=self.snapshot_cols)
+
         return df.reset_index(), snapshot_features
 
-    def _update_cumulative_frame(self, df: pd.DataFrame, cum_cols: list[str]) -> "GameweekProvider":
+    def _update_cumulative_frame(self, df: pd.DataFrame) -> "GameweekProvider":
         """
         Updates cumulative state dataframe, 
         with df no cumulative tally or by addition if is,
@@ -253,10 +139,10 @@ class GameweekProvider:
         # populate cumulative df if none exists, else add to existing df
         # cummulative df has columns given by cum_map
         if self.cumulative_df is None:
-            self.cumulative_df = df[cum_cols].rename(columns=self.cum_map).copy()
+            self.cumulative_df = df[self.cumulative_cols].rename(columns=self.cum_map).copy()
         else:
             # extract last total points to difference
-            self.cumulative_df = self.cumulative_df.add(df[cum_cols].rename(columns=self.cum_map), fill_value = 0.0)
+            self.cumulative_df = self.cumulative_df.add(df[self.cumulative_cols].rename(columns=self.cum_map), fill_value = 0.0)
 
         return self
 
@@ -300,7 +186,7 @@ class GameweekProvider:
             # returns a view, so copy
             df = self._stacked_data[self._stacked_data[self.cfg.gw_col] == gw].copy()
         else:    
-            df = pd.read_csv(self.season_root + f"/playermatchstats.csv")
+            df = pd.read_csv(self.season_root + f"GW{gw}/playermatchstats.csv")
         
         # guard: checks all features of col_map are in dataset
         missing = set(self.cfg.col_map.keys()) - set(df.columns)
@@ -313,30 +199,19 @@ class GameweekProvider:
         # if empty, denotes_epl is likely wrong, warn user of this
         if df.empty:
             logger.warning(f"GW{gw}: no data left after filtering for EPL")
-
-        # load output columns to list
-        output_cols = list(self.cfg.col_map.values())
         
         # rename to output column names
         df = df.rename(columns=self.cfg.player_id | self.cfg.col_map)
 
         # guard: coerce all output columns to numeric (real data may have string-typed floats)
-        df = self._force_numeric_cols(df, output_cols)
+        df = self._force_numeric_cols(df, self.output_cols)
 
         # featured = 1 if player has mins > 0, this will useful for averaging in priors
         df = self._add_featured_col(df)
-        output_cols.append("featured")
-
-        # does df contain snapshot features
-        if self.cfg.snapshot_cols:     
-            df, snapshot_features = self._separate_snapshot_cols(df, "player_id", self.cfg.snapshot_cols)
-
-        # aggregate (sums DGW appearances)
-        df = df.groupby("player_id").sum(numeric_only=True)
-
-        # add back snapshot_features now we have summed
-        if self.cfg.snapshot_cols:
-            df[self.cfg.snapshot_cols] = snapshot_features
+        
+        # aggregate (sums DGW appearances), ignoring ny non-cumulative columns
+        df[self.cumulative_cols] = df.groupby("player_id")[self.cumulative_cols].transform("sum")
+        df = df.drop_duplicates(subset=["player_id"], keep="last")
 
         # process df
         df = (
@@ -346,7 +221,7 @@ class GameweekProvider:
             .fillna(0.0)                                            # setting all stats 0 if they didn't feature
             .assign(player_team_id=self._player_team_index)         # adds column "{player_code}_{team_code}"
             .set_index("player_team_id")                            # indexes by new composite index column
-            .filter(items=output_cols)                              # select only output columns
+            .filter(items=self.output_cols)                         # select only output columns
             .astype(float)                                          # cast all columns as float, player_code safe as index
         )
 
@@ -357,16 +232,14 @@ class GameweekProvider:
                 for col, func in self.cfg.transform.items() if col in df.columns
             })
 
-        rate_cols  = [v for v in self.cum_map.keys()]
-        self._update_cumulative_frame(df, rate_cols)
+        self._update_cumulative_frame(df)
 
         # only per_90ify if minutes not 0, no div by 0
         # uses cumulative df to carry forward players per_90 rates even if they did no feature in gw          
-        per_90_cols = [v for v in output_cols if "per_90" in v]
         mask = self.cumulative_df["cum_minutes"] > 0.0
         
-        if per_90_cols and mask.any():
-            df = self._calculate_per_90(df, mask, per_90_cols)
+        if self.per_90_cols and mask.any():
+            df = self._calculate_per_90(df, mask, self.per_90_cols)
 
         return df
         
@@ -383,18 +256,20 @@ class Ingester:
     """
     def __init__(
         self,
+        features: Features,
         season_root: str,
         fpl_config: FPLSourceConfig,
         opta_config: FPLSourceConfig,
     ):
+        self.features = features
         self.season_root = season_root
-        self.fpl_provider = GameweekProvider(fpl_config, season_root)
-        self.opta_provider = GameweekProvider(opta_config, season_root)
+        self.fpl_provider = GameweekProvider(features, fpl_config, season_root)
+        self.opta_provider = GameweekProvider(features, opta_config, season_root)
         self.player_gw_stats: dict[int, pd.DataFrame] = {}
         self.player_cumulative_stats: dict[int, pd.DataFrame] = {}
         self.first_gw: dict[str, int] = {}
 
-        self.cum_rev_map = {**self.fpl_provider.cum_rev, **self.opta_provider.cum_rev}
+        self.cum_rev_map = features.inv_cumulative_map
 
     # --- Helper Functions ---
 
@@ -431,6 +306,9 @@ class Ingester:
             self.fpl_provider.cumulative_df, 
             self.opta_provider.cumulative_df,
         )
+        # ensure that gw_combined has columns ordered by convention
+        gw_combined = gw_combined[self.features.output_columns]
+
         self._update_first_gw(gw_combined, gw)
         return gw_combined, gw_cum_combined
 
@@ -440,11 +318,13 @@ class Ingester:
         logger.info("FPL and Opta cumulative tallies have been reset.")
         self.fpl_provider.reset()
         self.opta_provider.reset()
+        self.player_cumulative_stats = {}
+        self.player_gw_stats = {}
         self.first_gw = {}
         return self       
 
-    def ingest(self, gameweek_start: int, gameweek_end: int) -> dict[str, pd.DataFrame]:
-        """
+    def ingest(self, gameweek_start: int, gameweek_end: int) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+        """ 
         Ingests bulk data from a gameweek range
         """
         # warn user if running ingest() without reset
@@ -456,7 +336,7 @@ class Ingester:
 
         return self.player_gw_stats, self.player_cumulative_stats
 
-    def append_gw(self, gw: int) -> dict[str, pd.DataFrame]:
+    def append_gw(self, gw: int) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
         """
         Ingests a given gameweek
         WARNING: for functionality append_gw() never resets cumulative data,
