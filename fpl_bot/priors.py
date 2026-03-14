@@ -276,7 +276,7 @@ class PriorComputer:
         combined = pd.concat([per_90, snapshots, cum_df[["minutes", "mins_over_featured_var"]]], axis=1)
 
         # ensure combined has columns ordered by convention
-        combined = combined[self.features.output_columns]
+        combined = combined[self.features.pre_sequencer_columns]
 
         # output dict
         return self._output_df_to_dict(combined)

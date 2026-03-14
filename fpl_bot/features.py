@@ -3,6 +3,7 @@ import logging
 from enum import Enum  
 import math
 import pandas as pd
+from functools import cached_property
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -36,9 +37,10 @@ class DataSource(Enum):
     VAASTAV = "vaastav"
     FCI = "fci"
     OPTA = "opta"
+    SEQUENCER = "seq"
 
 class FeatureSpec:
-
+ 
     def __init__(
         self,
         name: str,
@@ -69,14 +71,14 @@ class FeatureSpec:
         self.max_value = max_value                      # max value of feature, for bounded
         self.min_value = min_value                      # min value of feature, for bounded and presence check
         self.period = period                            # period of cyclic feature
-
+ 
         # parameters fit from scaling 
         self.scaling_params = scaling_params if scaling_params is not None else [None, None]                 
-                                                        
-
-        
-    # --- Derived Column Names ---
-
+ 
+    # ══════════════════════════════════════════════════════════════════
+    #  Accumulation Properties
+    # ══════════════════════════════════════════════════════════════════
+ 
     @property
     def cum_col(self) -> str | None:
         """
@@ -96,47 +98,49 @@ class FeatureSpec:
     @property 
     def is_snapshot(self) -> bool:
         return self.accumulation == AccumulationType.NONE
-
+ 
     @property
     def is_per_90(self) -> bool:
         return self.accumulation == AccumulationType.PER_90
-
+ 
     @property
     def is_cumulative(self) -> bool:
         return self.accumulation != AccumulationType.NONE    
-
-
+ 
+ 
 class Features:
-
+ 
     def __init__(self, specs: list[FeatureSpec], eps=1e-8):
         # tuple makes immutable after initialisation
         self.specs = tuple(specs)
-
+ 
         self.eps = eps
         self._validate()
-
+ 
         # prebuild lookup 
         self._spec_by_name: dict[str, FeatureSpec] = {s.name: s for s in self.specs}
         # tensor masks
         self.scaling_masks = self._build_mode_masks()       # builds tensor, a mask for each scaling mode, shape = [n_features]
         self.type_masks = self._build_type_mask()           # builds tensor, a mask for each feature type, shape = [ n_features]
         self.temporal_mask = self._temporal_mask()          # builds tensor, a temporal mask, True is tempooral, shape = [n_features]
-
-    # --- Validation ---
-
+ 
+    # ══════════════════════════════════════════════════════════════════
+    #  Validation
+    # ══════════════════════════════════════════════════════════════════
+ 
     def _validate(self):
         # validate input
         # ensure no duplicates
         names = self.output_columns
         if len(names) != len(set(names)):
             raise ValueError("Duplicate feature names detected.")
-
+ 
         for s in self.specs:
             # periodic features require given period
             if s.feature_type == FeatureType.PERIODIC:
                 if s.period is None:
                     raise ValueError(f"{s.name} requires period.")
-
+ 
             if s.feature_type == FeatureType.BOUNDED:
                 # bound features require max, else if max not in data cannot calculate
                 if s.max_value is None:
@@ -155,31 +159,88 @@ class Features:
             if s.presence_check == True:
                 if s.min_value is None:
                     raise ValueError(f"{s.name} requires min_value to be presence check")
+ 
+       # --- Pipeline wiring guards ---
+ 
+            # every data-sourced feature must have source_columns wired up.
+            if s.feature_provider in set({DataSource.VAASTAV, DataSource.FCI, DataSource.OPTA}) and not s.source_columns:
+                raise ValueError(
+                    f"{s.name}: non-SEQUENCER feature (provider={s.feature_provider.value}) "
+                    f"must have source_columns mapping — otherwise the ingester cannot load it."
+                )
+ 
+            # sequencer features must NOT have source_columns or accumulation.
+            if s.feature_provider == DataSource.SEQUENCER:
+                if s.source_columns:
+                    raise ValueError(
+                        f"{s.name}: SEQUENCER feature must not have source_columns — "
+                        f"it is stamped at sequence-build time, not loaded from CSV."
+                    )
+                if s.accumulation != AccumulationType.NONE:
+                    raise ValueError(
+                        f"{s.name}: SEQUENCER feature must have accumulation=NONE — "
+                        f"sequencer features are not accumulated across gameweeks."
+                    )
+ 
+            # cumulative column uniqueness
+            cum_cols = []
+            if s.cum_col is not None:
+                cum_cols = cum_cols.append(s.cum_col) 
 
-        # Validate cumulative column uniqueness — two specs must not
-        # produce the same cum_col (e.g. both mapping to "cum_goals")
-        cum_cols = [s.cum_col for s in self.specs if s.cum_col is not None]
         if len(cum_cols) != len(set(cum_cols)):
             raise ValueError("Duplicate cumulative column names derived from specs.")
+    # ══════════════════════════════════════════════════════════════════
+    #  Column Name Lists
+    #  Properties that return lists of column names, used for tensor
+    #  indexing, ingestion, and accumulation logic.
+    #  cahched as built from tuple so immutable after init
+    # ══════════════════════════════════════════════════════════════════
+ 
+    @cached_property
+    def output_columns(self) -> list[str]:
+        """
+        This method defines global truth for features leaving sequencer, i.e for scaling and feeding to model.
+        Immutable as specs is frozen as tuple.
+        """
+        return [s.name for s in self.specs]
 
-    # --- Propterties ---
+    @cached_property
+    def pre_sequencer_columns(self) -> list[str]:
+        """
+        This method controls feature order before sequencer.
+        Immutable as specs is frozen as tuple.
+        """
+        return [
+            s.name for s in self.specs
+            if s.feature_provider != DataSource.SEQUENCER
+        ]
 
-    @property
+    @cached_property
+    def sequencer_columns(self) -> list[str]:
+        """
+        These are columns the sequencer stamps on every row it builds.
+        """
+        return [
+            s.name for s in self.specs
+            if s.feature_provider == DataSource.SEQUENCER
+        ]
+
+    @cached_property
     def temporal_columns(self) -> list[str]:
         """
         Columns that go into x_temporal (all non-categorical specs).
         Order matches their position in self.specs (stable for tensor indexing).
         """
         return [s.name for s in self.specs if s.temporal]
-
-    @property 
+ 
+    @cached_property
     def categorical_columns(self) -> list[str]:
         """
         Columns that go into x_categorical (embedded integer indices).
         """
         return [s.name for s in self.specs if not s.temporal]
-
-    @property 
+ 
+    @cached_property 
     def snapshot_columns(self) -> list[str]:
         """
         Columns NOT accumulated across GWs (AccumulationType.NONE).
@@ -188,7 +249,7 @@ class Features:
         """
         return [s.name for s in self.specs if s.is_snapshot]
     
-    @property 
+    @cached_property 
     def per_90_columns(self) -> list[str]:
         """
         Columns that are per-90 rates (AccumulationType.PER_90).
@@ -196,60 +257,66 @@ class Features:
         the per-90 calculation to after cumulative update.
         """
         return [s.name for s in self.specs if s.is_per_90]
-
-    @property 
+ 
+    @cached_property
     def cumulative_columns(self) -> list[str]:
         """
         Columns that are accumulated (PER_90 or RAW_CUMULATIVE).
         Used by PriorComputer for rate computation.
         """
         return [s.name for s in self.specs if s.is_cumulative]
-
-    @property
+ 
+    @cached_property
     def raw_cumulative_columns(self) -> list[str]:
         """
         Columns that are accumulated but NOT per-90 divided.
         Typically just 'minutes' and 'featured'.
         """
         return [s.name for s in self.specs if s.accumulation == AccumulationType.RAW_CUMULATIVE]
-
-    # --- Provider Specific Lookups ---
+ 
+    # ══════════════════════════════════════════════════════════════════
+    #  Provider-Filtered Column Lists
+    #  Same column lists as above, but narrowed to features that a
+    #  specific DataSource actually supplies.
+    # ══════════════════════════════════════════════════════════════════
+    
+    def columns_for(self, base_list: list[str], provider: DataSource):
+        """
+        Filter any column list to only those supplied by a given provider.
+        """
+        return [
+            name for name in base_list
+            if provider in self._spec_by_name[name].source_columns
+            and self._spec_by_name[name].source_columns[provider] is not None
+        ]
 
     def cumulative_columns_for(self, provider: DataSource) -> list[str]:
         """
         Cumulative output column names that exist in a given provider.
         Only includes snapshots that this provider actually supplies.
         """
-        return [
-            s for s in self.cumulative_columns
-            if provider in self._spec_by_name[s].source_columns
-            and self._spec_by_name[s].source_columns[provider] is not None
-        ]
-
+        return self._columns_for(self.cumulative_columns, provider)
+ 
     def per_90_columns_for(self, provider: DataSource) -> list[str]:
         """
         per_90 output column names that exist in a given provider.
         Only includes snapshots that this provider actually supplies.
         """
-        return [
-            s for s in self.per_90_columns
-            if provider in self._spec_by_name[s].source_columns
-            and self._spec_by_name[s].source_columns[provider] is not None
-        ]
-
+        return self._columns_for(self.per_90_columns, provider)
+ 
     def snapshot_columns_for(self, provider: DataSource) -> list[str]:
         """
         Snapshot output column names that exist in a given provider.
         Only includes snapshots that this provider actually supplies.
         """
-        return [
-            s for s in self.snapshot_columns
-            if provider in self._spec_by_name[s].source_columns
-            and self._spec_by_name[s].source_columns[provider] is not None
-        ]
-
-    # --- Column Mapping Dict Generators ---
-
+        return self._columns_for(self.snapshot_columns, provider)
+ 
+    # ══════════════════════════════════════════════════════════════════
+    #  Column Mapping Dicts
+    #  Dictionaries that map between output names, cumulative names,
+    #  and raw source column names.
+    # ══════════════════════════════════════════════════════════════════
+ 
     @property
     def cumulative_map(self) -> dict[str, str]:
         """
@@ -260,7 +327,7 @@ class Features:
             for s in self.specs
             if s.cum_col is not None
         }
-
+ 
     @property
     def inv_cumulative_map(self) -> dict[str, str]:
         """
@@ -270,7 +337,7 @@ class Features:
             cum: out 
             for out, cum in self.cumulative_map.items()
         }
-
+ 
     def cumulative_map_for(self, provider: DataSource) -> dict[str, str]:
         """
         output_col → cum_col for all accumulated features.
@@ -281,7 +348,7 @@ class Features:
             if provider in self._spec_by_name[s].source_columns
             and self._spec_by_name[s].source_columns[provider] is not None
         }
-
+ 
     def inv_cumulative_map_for(self, provider: DataSource) -> dict[str, str]:
         """
         output_col → cum_col for all accumulated features.
@@ -292,7 +359,7 @@ class Features:
             if provider in self._spec_by_name[s].source_columns
             and self._spec_by_name[s].source_columns[provider] is not None
         }
-
+ 
     def source_map(self, provider: DataSource) -> dict[str, str]:
         """
         source_col → output_col for one data provider.
@@ -306,9 +373,13 @@ class Features:
                 if source_col is not None:
                     result[source_col] = s.name
         return result
-
-    # --- Lookup Helpers ---
-
+ 
+    # ══════════════════════════════════════════════════════════════════
+    #  Spec Lookups
+    #  Access individual specs by name, index, or grouped by
+    #  mode / provider.
+    # ══════════════════════════════════════════════════════════════════
+ 
     def __getitem__(self, name: str) -> FeatureSpec:
         """
         Look up a FeatureSpec by name. Raises KeyError if not found.
@@ -317,10 +388,10 @@ class Features:
             return self._spec_by_name[name]
         except KeyError:
             raise KeyError(f"No feature named '{name}'. Available: {list(self._spec_by_name.keys())}")
-
+ 
     def __contains__(self, name: str) -> bool:
         return name in self._spec_by_name
-
+ 
     def index_of(self, name: str) -> int:
         """
         Position of a named feature in the tensor column ordering.
@@ -330,11 +401,11 @@ class Features:
             if s.name == name:
                 return i
         raise KeyError(f"No feature named '{name}'")
-
+ 
     @property
     def specs_by_mode(self) -> dict[ScalingMode, list[FeatureSpec]]:
         return {mode: [s for s in self.specs if s.scaling_mode == mode] for mode in ScalingMode}
-
+ 
     @property
     def specs_by_provider(self) -> dict[str, list[FeatureSpec]]:
         """
@@ -344,13 +415,17 @@ class Features:
         for s in self.specs:
             result.setdefault(s.feature_provider, []).append(s)
         return result
-
-    # --- Helper Functions ---
-
+ 
+    # ══════════════════════════════════════════════════════════════════
+    #  Tensor Mask Builders (private)
+    #  Called once at init to create boolean tensors used by the
+    #  scaling and encoding layers.
+    # ══════════════════════════════════════════════════════════════════
+ 
     def _temporal_mask(self):
         # build mask for temporal features, none temporal is inverse
         return torch.tensor([s.temporal for s in self.specs])
-
+ 
     def _build_mode_masks(self):
         # build masks for different scaling modes
         masks = {}
@@ -360,7 +435,7 @@ class Features:
                 dtype=torch.bool
             )
         return masks
-
+ 
     def _build_type_mask(self):
         # build mask by type of feature
         masks = {}
@@ -370,22 +445,11 @@ class Features:
                 dtype=torch.bool
             )
         return masks
-
-    # --- Public Utility ---
-
-    def __len__(self):
-        # return number of features
-        return len(self.specs)  
-
-    @property
-    def output_columns(self):
-        """
-        Most important method, 
-        This sets convention for features column order.
-        Works as specs is a tuple so immutatble...
-        """
-        return [s.name for s in self.specs]
-    
+ 
+    # ══════════════════════════════════════════════════════════════════
+    #  DataFrame Validation
+    # ══════════════════════════════════════════════════════════════════
+ 
     def validate_dataframe(self, df: pd.DataFrame, context: str = "") -> None:
         """
         Check that a DataFrame has the expected output columns.
@@ -402,7 +466,11 @@ class Features:
             raise ValueError(f"{context} missing columns: {sorted(missing)}")
         if extra:
             logger.warning(f"{context} has extra columns not in Features: {sorted(extra)}")
-                
+ 
+    # ══════════════════════════════════════════════════════════════════
+    #  Serialisation
+    # ══════════════════════════════════════════════════════════════════
+ 
     def to_dict(self):
         return [
             {
@@ -423,7 +491,7 @@ class Features:
             }
             for s in self.specs
         ]
-
+ 
     @classmethod
     def from_dict(cls, data):
         specs = []
@@ -447,4 +515,11 @@ class Features:
                 )
             )
         return cls(specs)   
-
+ 
+    # ══════════════════════════════════════════════════════════════════
+    #  Dunder Overrides
+    # ══════════════════════════════════════════════════════════════════
+ 
+    def __len__(self):
+        # return number of features
+        return len(self.specs)  

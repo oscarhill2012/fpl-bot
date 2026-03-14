@@ -307,7 +307,7 @@ class Ingester:
             self.opta_provider.cumulative_df,
         )
         # ensure that gw_combined has columns ordered by convention
-        gw_combined = gw_combined[self.features.output_columns]
+        gw_combined = gw_combined[self.features.pre_sequencer_columns]
 
         self._update_first_gw(gw_combined, gw)
         return gw_combined, gw_cum_combined

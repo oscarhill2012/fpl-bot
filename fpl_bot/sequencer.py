@@ -39,30 +39,33 @@ class SeasonSequencer:
     """
     def __init__(
         self,
+        features: Features,
         season_root: str,
         fpl_config_season: FPLSourceConfig,
         opta_config: FPLSourceConfig,
         player_meta: pd.DataFrame,
         fixture_df: pd.DataFrame,
         teams_df: pd.DataFrame,
-        features: Features,
         window_size: int=8,
         prior_data: PriorData | None = None,
     ):
         self.season_root = season_root
-        self._ingester = Ingester(season_root, fpl_config_season, opta_config)
+        self._ingester = Ingester(features, season_root, fpl_config_season, opta_config)
         self._window_size = window_size
         
         # generate list of catergorical and temporal features
-        self._temporal_features = features.temporal_specs
-        self._catergorical_features = features.catergorical_specs
+        self.features = features
+        self._temporal_features = features.temporal_columns
+        self._catergorical_features = features.catergorical_columns 
 
         # index by player code for fast lookup
-        if "player_code" in player_meta.columns:
-            self._player_meta = player_meta.set_index("player_code")
-        else:
-            self._player_meta = player_meta
+        if player_meta.index is not "player_team_id":
+            player_meta = player_meta.set_index("player_team_code")
+        
+        # save player_meta as a dict for quicker lookup
+        self._player_meta: dict[str, dict[str, int]] = player_meta.to_dict(orient="index")
 
+        
         # nothing ingested yet
         self._current_gameweek: int = 0
         self._prior_data = prior_data
@@ -99,15 +102,15 @@ class SeasonSequencer:
         self._current_gameweek = gw_end
 
         # add new data to gw_cache
-        for gw in range(gw_start, gw_end-1):
+        for gw in range(gw_start, gw_end+1):
             self._cache_gw(gw)
 
         if self._prior_data is None:
             self._prior_data = PriorData.from_data(
+                self.features,
                 self._ingester.player_gw_stats,
                 self._ingester.player_cumulative_stats,
-                self._player_meta,
-                self._ingester.cum_rev_map,
+                pd.DataFrame.from_dict(self._player_meta, orient="index"),
                 min_mins=450.0
             )
             self._prior_data.to_json(self.season_root)
@@ -154,7 +157,7 @@ class SeasonSequencer:
         # window must always start at seq_start > 0
         seq_start = max(1, target_gw - self._window_size)
 
-        return list(range(seq_start, target_gw-1))
+        return list(range(seq_start, target_gw))
 
     def _get_prior(self, player_team_id: str, team_code: str, position: str) -> dict[str, float]:
         """
@@ -217,8 +220,8 @@ class SeasonSequencer:
         constructs fixed length (_window_size) sequence up to target_gw,
         for each timestep decides if to use priors or real data
         """
-        position = self.player_meta.loc[player_team_id, "position"]
-        team_code = self.player_meta.loc[player_team_id, "team_code"]   
+        position = self._player_meta[player_team_id]["position"]
+        team_code = self._player_meta[player_team_id]["team_code"]   
         first_gw = self._first_gw[player_team_id]
         gw_window: list[int] = []
 
@@ -237,7 +240,7 @@ class SeasonSequencer:
         data_list = []
         for i, gw in enumerate(gw_window):
             if gw == 0:
-                prior_row["data_age"] = self.window_size - i
+                prior_row["data_age"] = self._window_size - i
                 data_list.append(list(prior_row.values()))
             else:
                 real_row = self._get_real_row(player_team_id, gw)
