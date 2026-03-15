@@ -1,10 +1,14 @@
 from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Callable
+
+import pandas as pd
+
 from .features import Features, FeatureSpec, DataSource
 from .player_team_index import player_team_index
-import pandas as pd
-from dataclasses import dataclass
-from typing import Callable
-import logging
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -24,7 +28,7 @@ class FPLSourceConfig:
     other_games: bool                           # if dataset contains non-EPL matches, is True
     gw_col: str | None                          # which col has the GW number
     gw_path: str | None                         # path pattern for per-GW files
-    transform: dict[str, Callable[[str], any]]  # transform feature
+    transform: dict[str, Callable[[str], Any]]  # transform feature
 
 
 class GameweekProvider:
@@ -60,11 +64,13 @@ class GameweekProvider:
 
         # generate column mapping dicts
         self.cum_map = features.cumulative_map_for(config.provider)
+        self.cum_rev_map = features.inv_cumulative_map_for(config.provider)
 
         # generate snapshot, cumulative and output column names for provider
+        # copy lists to avoid mutating the cached properties on the shared Features object
         self.snapshot_cols = features.snapshot_columns_for(self.cfg.provider)
-        self.cumulative_cols = features.cumulative_columns_for(self.cfg.provider)
-        self.output_cols = features.pre_sequencer_columns
+        self.cumulative_cols = list(features.cumulative_columns_for(self.cfg.provider))
+        self.output_cols = list(features.pre_sequencer_columns)
 
         # we add featured column, we want it to be cumulative (but not per_90) and be outputted
         self.output_cols.append("featured")
@@ -105,7 +111,7 @@ class GameweekProvider:
         gw_data = self._load_raw(gw)
 
         # validate dataframe
-        self.features.validate_dataframe(gw_data, self.output_cols, f"GW{gw}")
+        self.features.validate_dataframe_from(gw_data, self.cfg.provider, f"GW{gw}")
 
         gw_data = self._match_filter(gw_data, self.cfg.denotes_epl, f"GW{gw}")
 
@@ -167,7 +173,7 @@ class GameweekProvider:
         """Coerce specified columns to float, filling non-numeric values with 0.0."""
         missing = set(cols) - set(gw_data.columns)
         if missing:
-            raise ValueError(f"Cannot coerce column not in gw_data, {missing} is not")
+            raise ValueError(f"Columns {missing} not found in gameweek data.")
 
         # make columns numeric, if can't make 0.0
         gw_data[cols] = gw_data[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
@@ -201,7 +207,7 @@ class GameweekProvider:
         )
 
     def _apply_transforms(self, gw_data: pd.DataFrame) -> pd.DataFrame:
-        """Applys any columns tranforms in congic"""
+        """Apply any column transforms in config."""
         if self.cfg.transform:
             gw_data = gw_data.assign(**{
                 col: func(gw_data[col])
@@ -217,15 +223,18 @@ class GameweekProvider:
             self.cumulative_gw_data = gw_data[self.cumulative_cols].rename(columns=self.cum_map).copy()
         else:
             # extract last total points to difference
-            self.cumulative_gw_data = self.cumulative_gw_data.add(gw_data[self.cumulative_cols].rename(columns=self.cum_map), fill_value = 0.0)
+            self.cumulative_gw_data = self.cumulative_gw_data.add(
+                gw_data[self.cumulative_cols].rename(columns=self.cum_map),
+                fill_value=0.0,
+            )
 
         return self
 
     def _calculate_per_90(self, gw_data: pd.DataFrame, mask: pd.Series, features: list[str]) -> pd.DataFrame:
         """Update per-90 rates for rows with non-zero cumulative minutes."""
         gw_data.loc[mask, features] = (
-            self.cumulative_gw_data.loc[mask, self.cum_rev.keys()]
-            .rename(columns=self.cum_rev)
+            self.cumulative_gw_data.loc[mask, self.cum_rev_map.keys()]
+            .rename(columns=self.cum_rev_map)
             .div(self.cumulative_gw_data.loc[mask, "cum_minutes"] / 90, axis=0)
         )
         return gw_data
@@ -348,7 +357,7 @@ class Ingester:
     def _process_gw(self, gw: int) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Load and merge FPL and Opta data for a single gameweek."""
         # uses instances of GameweekProvider to load gw
-        gw_combined = self._combine_gw_datas(
+        gw_combined = self._combine_dfs(
             self.fpl_provider.load_gameweek(gw),
             self.opta_provider.load_gameweek(gw),
         )

@@ -198,7 +198,7 @@ class SeasonSequencer:
         first_gw = self._first_gw[player_team_id]
         gw_window: list[int] = []
 
-        # filter any gameweeks before, players first appearance
+        # filter any gameweeks before the player's first appearance
         # if player hasn't appeared yet first gw = 39 so window = []
         gw_window[:] = [i for i in window if i > first_gw]
 

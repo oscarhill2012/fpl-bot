@@ -1,11 +1,13 @@
-from typing import Tuple
+from __future__ import annotations
+
+import logging
 import warnings
+from typing import Tuple
+
 import torch
 
-from enum import Enum
-import math
 from .features import Features, ScalingMode, FeatureSpec
-import logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -234,7 +236,7 @@ class _LogScaler(_LinearScaler):
 
     def _validate(self, x: torch.Tensor):
         """Ensure no values below -1 to prevent log producing NaN."""
-        # ensures no values below -1 so log doesnt produce NAN
+        # ensures no values below -1 so log doesn't produce NaN
         if (x < -1).any().item():
             raise ValueError('Feature to be Log scaled contains value < -1')
 
@@ -322,7 +324,7 @@ class _RobustLog(_RobustScaler):
 
     def _validate(self, x: torch.Tensor):
         """Ensure no values below -1 to prevent log producing NaN."""
-        # ensure no values below -1 so log doesnt NAN
+        # ensure no values below -1 so log doesn't produce NaN
         if (x < -1).any().item():
             raise ValueError('Feature to be Log-Robust scaled contains value < -1')
 
@@ -339,7 +341,7 @@ class _RobustLog(_RobustScaler):
 
     def _inverse_transform_input(self, x: torch.Tensor) -> torch.Tensor:
         """Apply e^x - 1 to reverse the log transform."""
-        # e^(1+x)
+        # e^x - 1
         return torch.expm1(x)
 
 
@@ -376,14 +378,14 @@ class _BoundedScaler(_LinearScaler):
         # max_value generally not 0, but maybe we'd call for data < 0 and want min value < 0 and max = 0
         self.max_value = (
             max_value.to(self.device)
-            if min_value is not None
-            else torch.zeros(1, max_value.shape[1], device=self.device)
+            if max_value is not None
+            else torch.zeros(1, device=self.device)
         )
         # min generally 0 but can be set to non-zero if required
         self.min_value = (
             min_value.to(self.device)
             if min_value is not None
-            else torch.zeros(1, min_value.shape[1], device=self.device)
+            else torch.zeros(1, device=self.device)
         )
         self._fitted = True     # bounded scaler does not fit to params, min and max inputted,
                                 # self._fitted is unused for interface consistency
@@ -449,9 +451,6 @@ class _BoundedScaler(_LinearScaler):
         Returns:
             Scaled tensor of shape [n_samples, n_features].
         """
-        # again redundant,
-        # but for interface consistency we need to be able to call _BoundedScaler with fit from params,
-        # must rewrite function to use min and max not location and scale
         if not x.shape[-1] == params.shape[-1]:
             raise ValueError('Params and Data must both be same n_features')
         if torch.isnan(params).any().item():
@@ -506,6 +505,16 @@ class _BoundedScaler(_LinearScaler):
         return self._inverse_transform_input(x)
 
 
+_MODE_TO_SCALER = {
+    ScalingMode.LINEAR:     _LinearScaler,
+    ScalingMode.LOG:        _LogScaler,
+    ScalingMode.ROBUST:     _RobustScaler,
+    ScalingMode.LOG_ROBUST: _RobustLog,
+    ScalingMode.BOUNDED:    _BoundedScaler,
+    # IDENTITY intentionally absent
+}
+
+
 class FeatureScaler:
     """
     Mask-aware scaler for tensors of shape [batch, time, features].
@@ -547,15 +556,6 @@ class FeatureScaler:
         self._build_bound_tensor()
         # _fitted now refers to the collection of scalers generated upon init
         self._fitted = False
-
-        _MODE_TO_SCALER = {
-            ScalingMode.LINEAR:     _LinearScaler,
-            ScalingMode.LOG:        _LogScaler,
-            ScalingMode.ROBUST:     _RobustScaler,
-            ScalingMode.LOG_ROBUST: _RobustLog,
-            ScalingMode.BOUNDED:    _BoundedScaler,
-            # IDENTITY intentionally absent
-        }
 
         # n_scaled is how many features each scaling mode acts on
         self.n_scaled = {}
@@ -599,18 +599,16 @@ class FeatureScaler:
 
         # scaler gets data after presence and scaling masks applied
         # scaling mask is just which type of scaling is applied to which feature
-        x_scale = x[presence_mask]
+        x_present = x[presence_mask]
         for mode, scaler in self._scalers.items():
-            x_scale[:, self.scaling_masks[mode]] = scaler.fit_transform(x_scale[:, self.scaling_masks[mode]])
+            x_present[:, self.scaling_masks[mode]] = scaler.fit_transform(x_present[:, self.scaling_masks[mode]])
             param1, param2 = scaler.get_params
-            # params stored for each feature scaled
 
             for spec, p1, p2 in zip(self.specs_by_mode[mode], param1[0], param2[0], strict=True):
                 spec.scaling_params = [p1.item(), p2.item()]
-                # convention; p1 is location or min value, p2 is scale or max_value
 
-        # inverse presence mask
-        x[presence_mask] = x_scale
+        # write back scaled values for present rows
+        x[presence_mask] = x_present
         # now fitted
         self._fitted = True
         # return scaled tensor shape = [n_samples, n_timesteps, n_features], and return features dict, now with scaling params
@@ -640,12 +638,12 @@ class FeatureScaler:
         self._validate_input(x)
         x = x.clone()
         presence_mask = self._build_presence_mask(x).to(self.device)
-        x_scale = x[presence_mask]
+        x_present = x[presence_mask]
 
         for mode, scaler in self._scalers.items():
-            x_scale[:, self.scaling_masks[mode]] = scaler.transform(x_scale[:, self.scaling_masks[mode]])
+            x_present[:, self.scaling_masks[mode]] = scaler.transform(x_present[:, self.scaling_masks[mode]])
 
-        x[presence_mask] = x_scale
+        x[presence_mask] = x_present
         return x
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
@@ -693,9 +691,9 @@ class FeatureScaler:
         if not isinstance(x, torch.Tensor):
             raise TypeError('Input must be a tensor')
         if not torch.is_floating_point(x):
-            raise TypeError(f'Input must be type float, recieved {x.dtype}')
+            raise TypeError(f'Input must be type float, received {x.dtype}')
         if x.dim() != 3:
-            raise ValueError(f'Expected shape [Batch, Time, Feature], recieved {x.shape}')
+            raise ValueError(f'Expected shape [Batch, Time, Feature], received {x.shape}')
         if not x.shape[-1] == len(self.features):
             # masks generated internally, but double check
             raise RuntimeError('Tensor[Features] dimensions do not match Mask Dimensions')

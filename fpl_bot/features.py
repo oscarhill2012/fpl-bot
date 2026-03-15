@@ -1,9 +1,13 @@
-import torch
-from enum import Enum
-import math
-import pandas as pd
-from functools import cached_property
+from __future__ import annotations
+
 import logging
+import math
+from enum import Enum
+from functools import cached_property
+
+import pandas as pd
+import torch
+
 logger = logging.getLogger(__name__)
 
 class FeatureType(Enum):
@@ -36,6 +40,9 @@ class DataSource(Enum):
     FCI = "fci"
     OPTA = "opta"
     SEQUENCER = "seq"
+
+EXTERNAL_DATA_SOURCES = frozenset({DataSource.VAASTAV, DataSource.FCI, DataSource.OPTA})
+
 
 class FeatureSpec:
     """
@@ -83,24 +90,24 @@ class FeatureSpec:
             min_value: Minimum value for bounded scaling or presence check threshold.
             scaling_params: Fitted scaling parameters [p1, p2]; populated after scaling.
         """
-        self.name = name                                # feature name, output_name (this is global convention for names of features)
-        self.feature_provider = feature_provider        # which data set feature originates from "opta" or "fpl"
-        self.feature_type = feature_type                # data type of feature
-        self.scaling_mode = scaling_mode                # how feature will be scaled
-        self.temporal = temporal                        # does feature vary with time
-        self.accumulation = accumulation                # how ingester accumulates this across GWs
-          
-        self.presence_check = presence_check            # if true, any sample with feature value = min value is missing from data NOT 0
-        self.categories = categories                    # if categorical type, what categories
-        self.embedding_dim = embedding_dim              # if embedded, how many dims
-        self.max_value = max_value                      # max value of feature, for bounded
-        self.min_value = min_value                      # min value of feature, for bounded and presence check
-        self.period = period                            # period of cyclic feature
+        self.name = name
+        self.feature_provider = feature_provider
+        self.feature_type = feature_type
+        self.scaling_mode = scaling_mode
+        self.temporal = temporal
+        self.accumulation = accumulation
+
+        self.presence_check = presence_check
+        self.categories = categories
+        self.embedding_dim = embedding_dim
+        self.max_value = max_value
+        self.min_value = min_value
+        self.period = period
 
         # avoid mutable defaults
-        # {provider_name: raw_column_name} e.g. {"vaastav": "goals_scored", "fci": "goals_scored"}  
-        self.source_columns = source_columns if source_columns is not None else {}          
-        # parameters fit from scaling 
+        # {DataSource: raw_column_name}
+        self.source_columns = source_columns if source_columns is not None else {}
+        # fitted scaling parameters [p1, p2]
         self.scaling_params = scaling_params if scaling_params is not None else [None, None]
 
     #================================================
@@ -180,6 +187,7 @@ class Features:
         if len(names) != len(set(names)):
             raise ValueError("Duplicate feature names detected.")
 
+        cum_cols = []
         for s in self.specs:
             # periodic features require given period
             if s.feature_type == FeatureType.PERIODIC:
@@ -197,10 +205,10 @@ class Features:
                 if abs(s.max_value) < self.eps:
                     raise ValueError(f"max_value must be non-zero (abs < eps={self.eps}), received {s.max_value}.")
 
-            # categorical feature requires catergories
+            # categorical feature requires categories
             if s.feature_type == FeatureType.CATEGORICAL:
                 if s.categories is None:
-                    raise ValueError(f"{s.name} requires catergories")
+                    raise ValueError(f"{s.name} requires categories.")
 
             # a feature that implies data was present (i.e 0 means bad performance not missing) requires threshold
             if s.presence_check:
@@ -210,8 +218,7 @@ class Features:
        # --- Pipeline Wiring Guards ---
 
             # every data-sourced feature must have source_columns wired up.
-            if s.feature_provider \
-            in set({DataSource.VAASTAV, DataSource.FCI, DataSource.OPTA}) and not s.source_columns:
+            if s.feature_provider in EXTERNAL_DATA_SOURCES and not s.source_columns:
                 raise ValueError(
                     f"{s.name}: non-SEQUENCER feature (provider={s.feature_provider.value}) "
                     f"must have source_columns mapping — otherwise the ingester cannot load it."
@@ -231,7 +238,6 @@ class Features:
                     )
 
             # cumulative column uniqueness
-            cum_cols = []
             if s.cum_col is not None:
                cum_cols.append(s.cum_col)
 
@@ -316,6 +322,22 @@ class Features:
             name for name in base_list
             if provider in self._spec_by_name[name].source_columns
             and self._spec_by_name[name].source_columns[provider] is not None
+        ]
+
+    def source_columns_for(self, provider: DataSource) -> list[str]:
+        """
+        Source columns names supplied by a given provider.
+
+        Args:
+            provider: DataSource to filter by.
+
+        Returns:
+            Source column names available for that provider.
+        """
+        return [
+            s.source_columns[provider] for s in self.specs
+            if provider in s.source_columns
+            and s.source_columns[provider] is not None
         ]
 
     def cumulative_columns_for(self, provider: DataSource) -> list[str]:
@@ -476,63 +498,30 @@ class Features:
         return {mode: [s for s in self.specs if s.scaling_mode == mode] for mode in ScalingMode}
 
     @property
-    def specs_by_provider(self) -> dict[str, list[FeatureSpec]]:
+    def specs_by_provider(self) -> dict[DataSource, list[FeatureSpec]]:
         """Group specs by their feature_provider field."""
-        result: dict[str, list[FeatureSpec]] = {}
+        result: dict[DataSource, list[FeatureSpec]] = {}
         for s in self.specs:
             result.setdefault(s.feature_provider, []).append(s)
         return result
-
-    #================================================
-    # Tensor Mask Builders
-    # Private methods called once at initialisation to create boolean
-    # tensors used by the scaling and encoding layers.
-    #================================================
-
-    def _temporal_mask(self) -> torch.Tensor:
-        """Build boolean mask selecting temporal features; non-temporal is its inverse."""
-        # build mask for temporal features, none temporal is inverse
-        return torch.tensor([s.temporal for s in self.specs])
-
-    def _build_mode_masks(self) -> dict[ScalingMode, torch.Tensor]:
-        """Build boolean masks for each scaling mode."""
-        # build masks for different scaling modes
-        masks = {}
-        for ftype in ScalingMode:
-            masks[ftype] = torch.tensor(
-                [s.scaling_mode == ftype for s in self.specs],
-                dtype=torch.bool
-            )
-        return masks
-
-    def _build_type_mask(self) -> dict[FeatureType, torch.Tensor]:
-        """Build boolean masks for each feature type."""
-        # build mask by type of feature
-        masks = {}
-        for ftype in FeatureType:
-            masks[ftype] = torch.tensor(
-                [s.feature_type == ftype for s in self.specs],
-                dtype=torch.bool
-            )
-        return masks
 
     #================================================
     # DataFrame Validation
     # Runtime checks on DataFrames against the feature spec.
     #================================================
 
-    def validate_dataframe(self, df: pd.DataFrame, check_columns: list[str], context: str = "") -> None:
+    def validate_dataframe_from(self, df: pd.DataFrame, provider: DataSource, context: str = "") -> None:
         """
-        Check that a DataFrame contains check columns.
+        Check that a DataFrame from a provider contains the expected columns.
 
-        Raises ValueError with a clear message listing missing or extra columns.
+        Raises ValueError if columns are missing; logs a warning for extra columns.
 
         Args:
             df: DataFrame to validate.
-            check_columns: columns to check
-            context: Optional label for error messages, e.g. "{context} ingester output".
+            provider: DataSource whose source columns define the expected set.
+            context: Optional label for error messages, e.g. "GW1".
         """
-        expected = set(check_columns)
+        expected = set(self.source_columns_for(provider))
         actual = set(df.columns)
         missing = expected - actual
         extra = actual - expected
@@ -607,10 +596,39 @@ class Features:
         return cls(specs)
 
     #================================================
+    # Tensor Mask Builders
+    # Private methods called once at initialisation to create boolean
+    # tensors used by the scaling and encoding layers.
+    #================================================
+
+    def _temporal_mask(self) -> torch.Tensor:
+        """Build boolean mask selecting temporal features."""
+        return torch.tensor([s.temporal for s in self.specs])
+
+    def _build_mode_masks(self) -> dict[ScalingMode, torch.Tensor]:
+        """Build boolean masks for each scaling mode."""
+        masks = {}
+        for mode in ScalingMode:
+            masks[mode] = torch.tensor(
+                [s.scaling_mode == mode for s in self.specs],
+                dtype=torch.bool
+            )
+        return masks
+
+    def _build_type_mask(self) -> dict[FeatureType, torch.Tensor]:
+        """Build boolean masks for each feature type."""
+        masks = {}
+        for ftype in FeatureType:
+            masks[ftype] = torch.tensor(
+                [s.feature_type == ftype for s in self.specs],
+                dtype=torch.bool
+            )
+        return masks
+
+    #================================================
     # Dunder Overrides
     #================================================
 
     def __len__(self) -> int:
         """Return the number of features in this collection."""
-        # return number of features
         return len(self.specs)

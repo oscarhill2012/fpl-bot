@@ -1,12 +1,19 @@
 from __future__ import annotations
-import pandas as pd
-import numpy as np
-from dataclasses import dataclass
+
 import json
+import logging
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
 from .features import Features, FeatureSpec, FeatureType
 from .player_team_index import player_team_index
-import logging
+
 logger = logging.getLogger(__name__)
+
+DEFAULT_MIN_MINUTES = 450.0
+
 
 @dataclass
 class PriorData:
@@ -58,7 +65,7 @@ class PriorData:
         player_data: dict[int, pd.DataFrame],
         cumulative: dict[int, pd.DataFrame],
         player_meta: pd.DataFrame,
-        min_mins: float = 450.0,
+        min_mins: float = DEFAULT_MIN_MINUTES,
     ) -> "PriorData":
         """
         Convenience constructor — delegates to PriorComputer.
@@ -99,7 +106,7 @@ class PriorComputer:
         player_data: dict[int, pd.DataFrame],
         cumulative: dict[int, pd.DataFrame],
         player_meta: pd.DataFrame,
-        min_mins: float = 450.0,
+        min_mins: float = DEFAULT_MIN_MINUTES,
     ):
         """
         Initialise the PriorComputer.
@@ -180,28 +187,33 @@ class PriorComputer:
     def _validate_input(self):
         """Validate that cumulative and player_data dicts match gameweeks and index names."""
         if self.cumulative.keys() != self.player_data.keys():
-            raise RuntimeError("Inconsistent no. of GWs entered into compute priors")
+            raise RuntimeError("Inconsistent number of gameweeks between cumulative and player_data.")
         for key in self.cumulative.keys():
-            if (self.cumulative[key].index.name != "player_team_id") or (self.player_data[key].index.name != "player_team_id"):
-                raise TypeError("compute_priors() requires index is player_team_id for all df")
+            cum_indexed = self.cumulative[key].index.name == "player_team_id"
+            data_indexed = self.player_data[key].index.name == "player_team_id"
+            if not (cum_indexed and data_indexed):
+                raise TypeError("compute() requires index is player_team_id for all DataFrames.")
 
     @staticmethod
     def _coerce_categorical_cols(df: pd.DataFrame, cat_cols: list) -> pd.DataFrame:
         """Cast specified columns to categorical dtype for groupby with observed=False."""
         for col in cat_cols:
             # validate
-            if not col in df.columns:
+            if col not in df.columns:
                 raise ValueError("All cat_cols must be columns in DataFrame")
 
-            df[col]= df[col].astype("category")
+            df[col] = df[col].astype("category")
 
         return df
 
     def _per_90_calculation(self, cum_df: pd.DataFrame) -> pd.DataFrame:
         """Calculate per-90 rates from cumulative totals, renaming columns via cum_rev_map."""
+        cum_per_90_cols = [
+            self.features.cumulative_map[name]
+            for name in self.per_90_cols
+        ]
         return (
-            cum_df[self.per_90_cols]
-            .drop("cum_minutes", axis=1)
+            cum_df[cum_per_90_cols]
             .div(cum_df["cum_minutes"] / 90, axis=0)
             .replace([np.inf, -np.inf, np.nan], 0.0)
             .rename(columns=self.cum_rev_map)
@@ -211,7 +223,7 @@ class PriorComputer:
     def _variance_of_ratio(df: pd.DataFrame, group: dict, numerator: str, denominator: str) -> pd.Series:
         """Calculate the per-group standard deviation of the ratio numerator/denominator."""
         ratio = df[group["by"] + [numerator, denominator]].copy()
-        ratio["ratio"]= df[numerator] / df[denominator]
+        ratio["ratio"] = df[numerator] / df[denominator]
 
         return ratio.groupby(**group)["ratio"].std().fillna(0.0)
 
@@ -253,7 +265,11 @@ class PriorComputer:
     def _extract_totals(self) -> pd.DataFrame:
         """Build a combined DataFrame of cumulative and snapshot totals for all players."""
         # stack player_data into one df
-        player_stacked = pd.concat([df[self.snapshot_cols + ["minutes"]] for df in self.player_data.values()], axis=0)
+        snapshot_frames = [
+            df[self.snapshot_cols + ["minutes"]]
+            for df in self.player_data.values()
+        ]
+        player_stacked = pd.concat(snapshot_frames, axis=0)
 
         snapshot_features = self._sum_weighted_features(player_stacked)
 
@@ -267,7 +283,12 @@ class PriorComputer:
         )
         return output
 
-    def _compute_level(self, group_cols: list[str] | None = None, input_df: pd.DataFrame | None = None, minutes_threshold: float = 0.0) -> dict[str, dict[str, float]]:
+    def _compute_level(
+        self,
+        group_cols: list[str] | None = None,
+        input_df: pd.DataFrame | None = None,
+        minutes_threshold: float = 0.0,
+    ) -> dict[str, dict[str, float]]:
         """Compute priors for a given hierarchy level, defined by group_cols."""
         # copy dataframe, so no mutation
         if input_df is None:
