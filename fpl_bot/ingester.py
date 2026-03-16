@@ -19,17 +19,172 @@ class FPLSourceConfig:
     All output columns required must be present in col_map (excluding defaults),
     and any defaults will be added to col_map automatically.
     """
-    provider: DataSource                        # data providers tag, "vaastav", "fci", "opta"
-    col_map: dict[str, str]                     # source_col → output columns (should contain all columns even if no change)
-    player_id: dict[str, str]                   # maps player_id tag in dataset to "player_id"
-    id_map: pd.DataFrame                        # dataframe that contains id in relation to player code
-    stacked: bool                               # one big file vs per-GW files
-    denotes_epl: dict[str, str]                 # verifies data from epl match: {identifying feature: identifying string}
-    other_games: bool                           # if dataset contains non-EPL matches, is True
-    gw_col: str | None                          # which col has the GW number
-    gw_path: str | None                         # path pattern for per-GW files
-    transform: dict[str, Callable[[str], Any]]  # transform feature
+    provider: DataSource                                # data providers tag, "vaastav", "fci", "opta", "fixture"
+    col_map: dict[str, str]                             # source_col → output columns (should contain all columns even if no change)
+    player_id: dict[str, str]                           # maps player_id column name in dataset to "player_id"
+    id_map: pd.DataFrame                                # dataframe that contains local identity to global identity map
+    stacked: bool                                       # one big file vs per-GW files
+    denotes_epl: dict[str, str]                         # verifies data from epl match: {identifying feature: identifying string}
+    other_games: bool                                   # if dataset contains non-EPL matches, is True
+    gw_col: str | None                                  # which col has the GW number
+    gw_path: str | None                                 # path pattern for per-GW files
+    transform: dict[str, Callable[[str], Any]] | None   # transform feature
 
+@dataclass
+class FixtureSourceConfig:
+    """
+    Encodes the distinct nature of a fixture source so all sources can be treated uniformly.
+
+    All output columns required must be present in col_map (excluding defaults),
+    and any defaults will be added to col_map automatically.
+    """
+    provider: DataSource                                # data providers tag, "vaastav", "fci", "opta", "fixture"
+    col_map: dict[str, str]                             # source_col → output columns (should contain all columns even if no change)
+    team_codes: pd.DataFrame
+    stacked: bool                                       # one big file vs per-GW files
+    denotes_epl: dict[str, str]                         # verifies data from epl match: {identifying feature: identifying string}
+    other_games: bool                                   # if dataset contains non-EPL matches, is True
+    gw_col: str | None                                  # which col has the GW number
+    gw_path: str | None                                 # path pattern for per-GW files
+
+
+class FixtureProvider:
+    def __init__(
+        self,
+        features: Features,
+        config: FixtureSourceConfig,
+        season_root: str,
+    ):
+        """
+        Initialise a FixtureProvider.
+
+        Args:
+            features: Global feature registry.
+            config: Source configuration for this provider.
+            season_root: Path to the season data directory.
+        """
+        self.features = features
+        self.cfg = config
+        self.season_root = season_root
+        self.fixture_columns = features.fixture_columns
+
+    #================================================
+    # Public Functions
+    #================================================
+
+    def load_fixtures(self, gw: int) -> pd.DataFrame:
+        """
+        Loads fixture data for one gameweek, from given FixtureSource.
+
+        Args:
+            gw: which gameweek to load
+        
+        Returns:
+            DataFrame with fixture_columns from features
+        """
+        # rename columns so they end at team_code when processing
+        raw_fixtures = (
+            pd.read_csv(self.season_root + self.cfg.gw_path + f"GW{gw}/matches.csv")
+            .rename(columns={"home_team": "home_team_code", "away_team": "away_team_code"})
+        )
+        raw_fixtures = self._match_filter(raw_fixtures, self.cfg.denotes_epl, f"GW{gw}")
+        
+        # dataset gives one row per game (teams are home and away)
+        # we want one row per team, so we need to split and rename columns
+        home_df, away_df = self._home_away_split(raw_fixtures)
+        home_df, away_df = self._remap_col_names(home_df, away_df)
+
+        # is_home introduced to explicitly convey if team home or away
+        home_df, away_df = self._add_is_home(home_df, away_df)
+
+        # stack home and away teams, giving one row per team that played
+        gw_fixtures = pd.concat([home_df, away_df], axis=0)
+
+        # if team didnt play add in blank row, 
+        # is_home = -1 (0 = away, 0 != not playing)
+        gw_fixtures = self._join_team_universe(gw_fixtures)
+
+        gw_fixtures = (
+            gw_fixtures
+            .set_index("team_code")                                 # indexes by new composite index column
+            .filter(items=self.fixture_columns)                     # select only output columns
+            .round()                                                # round any ELOs
+            .astype(int)                                            # set as ints       
+        )
+
+        gw_fixtures = gw_fixtures[self.fixture_columns]
+
+        return gw_fixtures
+
+    #================================================   
+    # Private Helpers
+    #================================================   
+
+    def _match_filter(self, gw_data: pd.DataFrame, identifier: dict[str, str], context: str = "") -> pd.DataFrame:
+        """If multiple matches, filter DataFrame rows for key column contains value string."""
+        if self.cfg.other_games:
+            for col, string in identifier.items():
+                # regex ensures string can contain special characters
+                gw_data = gw_data[gw_data[col].str.contains(string, regex=False)]
+
+        # if empty, filter is likely wrong, warn user of this
+        if gw_data.empty:
+            logger.warning(f"{context}: no data left after filtering for EPL")
+
+        return gw_data
+
+    @staticmethod
+    def _home_away_split(gw_fixtures: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Seperate home and away features, into two dfs"""
+        home_columns = [col for col in gw_fixtures.columns if "home" in col]
+        away_columns = [col for col in gw_fixtures.columns if "away" in col]
+
+        home_df = gw_fixtures[home_columns]
+        away_df = gw_fixtures[away_columns]
+        
+        return home_df, away_df 
+
+    @staticmethod
+    def _remap_col_names(
+        home_df: pd.DataFrame,
+        away_df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Strip home_/away_ prefixes and add oppo_ prefix for opponent columns."""
+        # strip prefixes to get neutral column names
+        home_neutral = {col: col.replace("home_", "") for col in home_df.columns}
+        away_neutral = {col: col.replace("away_", "") for col in away_df.columns}
+
+        # for home team: own stats are home columns, opponent stats are away columns
+        home_own = home_df.rename(columns=home_neutral)
+        home_oppo = away_df.rename(
+            columns={col: f"oppo_{neutral}" for col, neutral in away_neutral.items()},
+        )
+        home_combined = pd.concat([home_own, home_oppo], axis=1)
+
+        # for away team: own stats are away columns, opponent stats are home columns
+        away_own = away_df.rename(columns=away_neutral)
+        away_oppo = home_df.rename(
+            columns={col: f"oppo_{neutral}" for col, neutral in home_neutral.items()},
+        )
+        away_combined = pd.concat([away_own, away_oppo], axis=1)
+
+        return home_combined, away_combined
+    
+    @staticmethod
+    def _add_is_home(home_df: pd.DataFrame, away_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Add is_home column: 1 for home team, 0 for away team."""
+        home_df["is_home"] = 1
+        away_df["is_home"] = 0
+
+        return home_df, away_df
+
+    def _join_team_universe(self, fixtures: pd.DataFrame) -> pd.DataFrame:
+        """Right-join on team_codes so every known team has a row. -1 for missing is_home."""
+        return (
+            fixtures
+            .merge(self.cfg.team_codes, on="team_code", how="right")  # ensure every team has a row
+            .fillna({"is_home": -1})                                  # -1 signals team didn't play this GW
+        )
 
 class GameweekProvider:
     """
@@ -261,6 +416,7 @@ class Ingester:
         season_root: str,
         fpl_config: FPLSourceConfig,
         opta_config: FPLSourceConfig,
+        fixture_config: FixtureSourceConfig,
     ):
         """
         Initialise the Ingester with FPL and Opta data providers.
@@ -270,19 +426,25 @@ class Ingester:
             season_root: Path to the season data directory.
             fpl_config: Source configuration for the FPL/Vaastav data.
             opta_config: Source configuration for the Opta data.
+            fixture_config: Source configuration for fixture/Elo data.
         """
         self.features = features
         self.season_root = season_root
+
+        # initialise providers
         self.fpl_provider = GameweekProvider(features, fpl_config, season_root)
         self.opta_provider = GameweekProvider(features, opta_config, season_root)
+        self.fixture_provider = FixtureProvider(features, fixture_config, season_root)
+        # assign states for data storage
         self.player_gw_stats: dict[int, pd.DataFrame] = {}
         self.player_cumulative_stats: dict[int, pd.DataFrame] = {}
         self.first_gw: dict[str, int] = {}
+        self.fixtures: dict[int, pd.DataFrame] = {}
 
         self.cum_rev_map = features.inv_cumulative_map
 
     #================================================
-    # Public Functions
+    # Player Data Ingestion
     #================================================
 
     def reset(self) -> "Ingester":
@@ -331,6 +493,46 @@ class Ingester:
         """
         self.player_gw_stats[gw], self.player_cumulative_stats[gw] = self._process_gw(gw)
         return self.player_gw_stats, self.player_cumulative_stats
+
+    #================================================
+    # Feature Ingestion
+    #================================================
+
+    def ingest_fixtures_range(self, gameweek_start: int, gameweek_end: int) -> dict[int, pd.DataFrame]:
+        """
+        Ingest fixture data for a range of gameweeks.
+
+        Args:
+            gameweek_start: First gameweek to ingest (inclusive).
+            gameweek_end: Last gameweek to ingest (inclusive).
+
+        Returns:
+            Dict of {gameweek: fixture DataFrame}.
+        """
+        for gw in range(gameweek_start, gameweek_end + 1):
+            self.fixtures[gw] = self.fixture_provider.load_fixtures(gw)
+
+        return self.fixtures
+
+    def update_future_fixtures(self, current_gameweek: int, final_gameweek: int = 38) -> "Ingester":
+        """
+        Re-ingest future fixtures, from current gameweek until end of season.
+
+        Distinct from ingest_fixtures_range because Elo ratings in fixture files
+        change after results come in. Only future gameweeks should be refreshed;
+        updating past fixtures would leak result information into the model.
+
+        Args:
+            current_gameweek: First gameweek to refresh (inclusive).
+            final_gameweek: Last gameweek to refresh (inclusive), defaults to 38.
+
+        Returns:
+            Self, to make the state mutation explicit.
+        """
+        for gw in range(current_gameweek, final_gameweek + 1):
+            self.fixtures[gw] = self.fixture_provider.load_fixtures(gw)
+
+        return self
 
     #================================================
     # Private Helpers

@@ -21,7 +21,6 @@ class FeatureType(Enum):
     PERIODIC = "periodic"                 # periodic numeric
     IDENTITY = "identity"                 # leave untouched
 
-
 class ScalingMode(Enum):
     LINEAR = 'linear'
     LOG = 'log'
@@ -39,9 +38,10 @@ class DataSource(Enum):
     VAASTAV = "vaastav"
     FCI = "fci"
     OPTA = "opta"
+    FIXTURE = "fixture"
     SEQUENCER = "seq"
 
-EXTERNAL_DATA_SOURCES = frozenset({DataSource.VAASTAV, DataSource.FCI, DataSource.OPTA})
+EXTERNAL_DATA_SOURCES = frozenset({DataSource.VAASTAV, DataSource.FCI, DataSource.OPTA, DataSource.FIXTURE})
 
 
 class FeatureSpec:
@@ -51,7 +51,6 @@ class FeatureSpec:
     Describes how a feature should be sourced, accumulated, scaled, and encoded.
     Used by the ingester, sequencer, and scaler to handle each feature correctly.
     """
-
     def __init__(
         self,
         name: str,
@@ -109,6 +108,40 @@ class FeatureSpec:
         self.source_columns = source_columns if source_columns is not None else {}
         # fitted scaling parameters [p1, p2]
         self.scaling_params = scaling_params if scaling_params is not None else [None, None]
+
+        self._validate()
+
+    #================================================
+    # Validation
+    #================================================
+ 
+    def _validate(self):
+        """Validate feature spec fields, raising ValueError on misconfiguration."""
+        # periodic features require given period
+        if self.feature_type == FeatureType.PERIODIC:
+            if self.period is None:
+                raise ValueError(f"{self.name} requires period.")
+
+        if self.feature_type == FeatureType.BOUNDED:
+            # bounded features require max, else if max not in data cannot calculate
+            if self.max_value is None:
+                raise ValueError(f"{self.name} requires a max_value.")
+            # finite max_value
+            if not math.isfinite(self.max_value):
+                raise ValueError(f"max_value must be finite, received {self.max_value}.")
+            # max_value must be non-zero
+            if abs(self.max_value) < self.eps:
+                raise ValueError(f"max_value must be non-zero (abs < eps={self.eps}), received {self.max_value}.")
+
+        # categorical feature requires categories
+        if self.feature_type == FeatureType.CATEGORICAL:
+            if self.categories is None:
+                raise ValueError(f"{self.name} requires categories.")
+
+        # a feature that implies data was present (i.e 0 means bad performance not missing) requires threshold
+        if self.presence_check:
+            if self.min_value is None:
+                raise ValueError(f"{self.name} requires min_value to be presence check")
 
     #================================================
     # Accumulation Properties
@@ -189,32 +222,6 @@ class Features:
 
         cum_cols = []
         for s in self.specs:
-            # periodic features require given period
-            if s.feature_type == FeatureType.PERIODIC:
-                if s.period is None:
-                    raise ValueError(f"{s.name} requires period.")
-
-            if s.feature_type == FeatureType.BOUNDED:
-                # bounded features require max, else if max not in data cannot calculate
-                if s.max_value is None:
-                    raise ValueError(f"{s.name} requires a max_value.")
-                # finite max_value
-                if not math.isfinite(s.max_value):
-                    raise ValueError(f"max_value must be finite, received {s.max_value}.")
-                # max_value must be non-zero
-                if abs(s.max_value) < self.eps:
-                    raise ValueError(f"max_value must be non-zero (abs < eps={self.eps}), received {s.max_value}.")
-
-            # categorical feature requires categories
-            if s.feature_type == FeatureType.CATEGORICAL:
-                if s.categories is None:
-                    raise ValueError(f"{s.name} requires categories.")
-
-            # a feature that implies data was present (i.e 0 means bad performance not missing) requires threshold
-            if s.presence_check:
-                if s.min_value is None:
-                    raise ValueError(f"{s.name} requires min_value to be presence check")
-
        # --- Pipeline Wiring Guards ---
 
             # every data-sourced feature must have source_columns wired up.
@@ -271,6 +278,11 @@ class Features:
             s.name for s in self.specs
             if s.feature_provider == DataSource.SEQUENCER
         ]
+
+    @cached_property
+    def fixture_columns(self) -> list[str]:
+        """Feature names that come from fixture information"""
+        return [s.name for s in self.specs if s.feature_provider == DataSource.FIXTURE]
 
     @cached_property
     def temporal_columns(self) -> list[str]:
@@ -339,6 +351,18 @@ class Features:
             if provider in s.source_columns
             and s.source_columns[provider] is not None
         ]
+
+    def categorical_columns_for(self, provider: DataSource) -> list[str]:
+        """
+        Categorical output column names supplied by a given provider.
+
+        Args:
+            provider: DataSource to filter by.
+
+        Returns:
+            Categorical column names available for that provider.
+        """
+        return self._columns_for(self.categorical_columns, provider)
 
     def cumulative_columns_for(self, provider: DataSource) -> list[str]:
         """
