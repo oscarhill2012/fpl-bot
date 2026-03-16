@@ -3,9 +3,9 @@ import math
 import numpy as np
 import pandas as pd
 import torch
-from torch._C import int16
+
 from torch.utils.data import Dataset
-from .ingester import Ingester, FPLSourceConfig
+from .ingester import Ingester, FPLSourceConfig, FixtureSourceConfig
 from .priors import PriorComputer, PriorData
 from .features import Features, FeatureSpec, FeatureType
 from .player_team_index import player_team_index
@@ -44,8 +44,8 @@ class SeasonSequencer:
         season_root: str,
         fpl_config_season: FPLSourceConfig,
         opta_config: FPLSourceConfig,
+        fixture_config: FixtureSourceConfig,
         player_meta: pd.DataFrame,
-        fixture_df: pd.DataFrame,
         teams_df: pd.DataFrame,
         window_size: int=8,
         prior_data: PriorData | None = None,
@@ -67,13 +67,13 @@ class SeasonSequencer:
                 first ingest_range() call.
         """
         self.season_root = season_root
-        self._ingester = Ingester(features, season_root, fpl_config_season, opta_config)
+        self._ingester = Ingester(features, season_root, fpl_config_season, opta_config, fixture_config)
         self._window_size = window_size
 
         # generate list of categorical and temporal features
         self.features = features
         self._temporal_features = features.temporal_columns
-        self._catergorical_features = features.categorical_columns
+        self._categorical_features = features.categorical_columns
 
         # index by player code for fast lookup
         if player_meta.index.name != "player_team_id":
@@ -82,10 +82,10 @@ class SeasonSequencer:
             self.player_meta = meta.set_index("player_team_id")
         else:
             meta = player_meta.copy()
+            self.player_meta = meta
 
         # save player_meta as a dict for quicker lookup
         self._player_meta: dict[str, dict[str, int]] = meta.to_dict(orient="index")
-
 
         # nothing ingested yet
         self._current_gameweek: int = 0
@@ -98,16 +98,29 @@ class SeasonSequencer:
         self._fixture_lookup: dict[tuple[int, str], dict] = {}
 
         # cache data in as dict, so lookup cheaper than pandas .loc
-        self.gw_cache: dict[int, dict[str, dict[str, float]]] = {}
+        self.player_cache: dict[int, dict[str, dict[str, float]]] = {}
+        self.fixture_cache: dict[int, dict[int, int]] = {0: self._build_prior_fixtures()}
+
+    #================================================
+    # Initialise Helpers
+    #================================================
+
+    def _build_prior_fixtures(self) -> "SeasonSequencer":
+        """Fixture data is left blank for priors"""
+
+        return {
+            feature: 0 if feature != "is_home" else 1
+            for feature in self.features.fixture_columns
+        }
 
     #================================================
     # Ingestion and State Management
     # Methods for loading gameweeks and advancing state.
     #================================================
 
-    def ingest_range(self, gw_start: int, gw_end: int) -> "SeasonSequencer":
+    def ingest_player_range(self, gw_start: int, gw_end: int) -> "SeasonSequencer":
         """
-        Bulk-ingest a range of gameweeks.
+        Bulk-ingest player data for range of gameweeks.
 
         Computes prior data from the ingested range if none has been provided.
 
@@ -122,6 +135,8 @@ class SeasonSequencer:
         self._ingester.reset()
 
         self._ingester.ingest(gw_start, gw_end)
+        self._ingester.ingest_fixtures_range(gw_start, gw_end)
+
         self._first_gw = self._ingester.first_gw
         self._current_gameweek = gw_end
 
@@ -163,6 +178,7 @@ class SeasonSequencer:
         self._current_gameweek += 1
 
         self._ingester.append_gw(self._current_gameweek)
+        self._ingester.update_future_fixtures(self._current_gameweek)
         self._first_gw = self._ingester.first_gw
 
         self._cache_gw(self._current_gameweek)
@@ -173,12 +189,30 @@ class SeasonSequencer:
         return self
 
     #================================================
+    # Private Helpers
+    #================================================
+
+    def _cache_gw(self, gw: int) -> "SeasonSequencer":
+        """Convert the ingested DataFrame for a gameweek to a nested dict for fast lookup."""
+
+        self.player_cache[gw] = self._ingester.player_gw_stats[gw].to_dict(orient="index")
+        self.fixture_cache[gw] = self._ingester.fixtures[gw].to_dict(orient="index")
+
+        return self
+
+
+    #================================================
     # Sequence Construction
     # Methods that build fixed-length player sequences
     # from cached gameweek data and prior estimates.
     #================================================
 
-    def build_player_window(self, player_team_id: str, window: list[int], inference: bool = False) -> dict:
+    def build_player_window(
+        self, 
+        player_team_id: str, 
+        window: list[int], 
+        inference: bool = False
+        ) -> tuple[np.array, np.array]:
         """
         Construct a fixed-length sequence of gameweek rows for a single player.
 
@@ -191,7 +225,7 @@ class SeasonSequencer:
             inference: Whether the sequence is being built for inference.
 
         Returns:
-            Dict containing the assembled sequence data.
+            two arrays: temporal feauture, categorical features
         """
         position = self._player_meta[player_team_id]["position"]
         team_code = self._player_meta[player_team_id]["team_code"]
@@ -200,44 +234,47 @@ class SeasonSequencer:
 
         # filter any gameweeks before the player's first appearance
         # if player hasn't appeared yet first gw = 39 so window = []
-        gw_window[:] = [i for i in window if i > first_gw]
+        gw_window[:] = [i for i in window if i >= first_gw]
 
         # window must always be len self._window_size, 0 in window => prior row
-        n_pad = self._window_size - len(window)
+        n_pad = self._window_size - len(gw_window)
         gw_window[:0] = [0] * n_pad
 
         if n_pad != 0:
-            prior_row = self._get_prior(player_team_id, team_code, position)
-            self._verify_consistent_features(list(prior_row.keys()), self._temporal_features + ["is_prior", "data_age"])
+            temporal_prior_row = self._get_prior(player_team_id, team_code, position)
+            # blank fixtures row is cached at gw=0
+            temporal_prior_row.update(self.fixture_cache[0])
+            # optional guard
+            self._verify_consistent_features(list(temporal_prior_row.keys()), self._temporal_features + ["is_prior", "data_age"])
 
-        data_list = []
+        # list of categorical features
+        categorical_row = list(self._player_meta[player_team_id].values())
+
+        temporal_list = []
+        categorical_list = []
         for i, gw in enumerate(gw_window):
+            # categorical stays same for each gw by definition
+            categorical_list.append(categorical_row)
+
+            # 0 => prior
             if gw == 0:
-                prior_row["data_age"] = self._window_size - i
-                data_list.append(list(prior_row.values()))
+                temporal_prior_row["data_age"] = self._window_size - i
+                temporal_list.append(list(temporal_prior_row.values()))
+                
             else:
-                real_row = self._get_real_row(player_team_id, gw)
-                data_list.append(list(real_row.values()))
-                self._verify_consistent_features(list(real_row.keys()), self._temporal_features + ["is_prior", "data_age"])
+                temporal_real_row = self._get_real_row(player_team_id, gw)
+                temporal_real_row.update(self.fixture_cache[gw])
+                temporal_list.append(list(temporal_real_row.values()))
+                # optional guard
+                self._verify_consistent_features(list(temporal_real_row.keys()), self._temporal_features + ["is_prior", "data_age"])
 
         # convert to 2D numpy array, shape [n_timesteps, n_features]
-        x_temporal = np.array(data_list, dtype=np.float32)
-
+        return np.array(temporal_list, dtype=np.float32), np.array(categorical_list, dtype=np.int32)
+        
+        
     #================================================
     # Private Helpers
     #================================================
-
-    def _cache_gw(self, gw: int) -> "SeasonSequencer":
-        """Convert the ingested DataFrame for a gameweek to a nested dict for fast lookup."""
-        self.gw_cache[gw] = self._ingester.player_gw_stats[gw].to_dict(orient="index")
-        return self
-
-    def _update_team_strength(self, teams_df: pd.DataFrame) -> "SeasonSequencer":
-        """Update team strength and ELO from a new teams DataFrame."""
-        self._team_strength = self._parse_team_strength(teams_df)
-        logger.info("Updated team strength")
-
-        return self
 
     def _build_window(self, target_gw: int) -> list[int]:
         """Build the list of gameweeks in the sliding window ending before target_gw."""
@@ -260,15 +297,12 @@ class SeasonSequencer:
 
         elif pos_team in self._prior_data.position_team:
             prior_row = {**self._prior_data.position_team[pos_team]}
-            prior_row["minutes"] = self._minutes_lookup(prior_row)
 
         elif position in self._prior_data.position:
             prior_row = {**self._prior_data.position[position]}
-            prior_row["minutes"] = self._minutes_lookup(prior_row)
 
         else:
             prior_row = {**self._prior_data.league["league"]}
-            prior_row["minutes"] = self._minutes_lookup(prior_row)
 
         # add row to denote prior, "data_age" is sentinel
         prior_row["is_prior"], prior_row["data_age"] = 1.0, 0.0
@@ -279,11 +313,11 @@ class SeasonSequencer:
     def _minutes_lookup(prior_row: dict[str, float]) -> float:
         """Return a scaled minutes estimate for a player with no recorded data; currently a stub returning 0.0."""
         return 0.0
-
+        
     def _get_real_row(self, player_team_code: str, gw: int) -> dict[str, float]:
         """Retrieve a player's cached stats for a given gameweek."""
         # player lookup in cache
-        real_row = self.gw_cache[gw][player_team_code]
+        real_row = {**self.player_cache[gw][player_team_code]}
 
         # add row to denote prior, "data_age" is sentinel
         real_row["is_prior"], real_row["data_age"] = 0.0, 0.0

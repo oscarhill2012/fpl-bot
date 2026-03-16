@@ -10,6 +10,10 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Small epsilon for numerical stability in validation checks.
+_EPS = 1e-8
+
+
 class FeatureType(Enum):
     GAUSSIAN = "gaussian"                 # symmetric continuous
     SKEWED_POSITIVE = "skewed_positive"   # heavy right tail
@@ -54,12 +58,11 @@ class FeatureSpec:
     def __init__(
         self,
         name: str,
-        feature_provider: DataSource,
         feature_type: FeatureType,
         scaling_mode: ScalingMode,
         accumulation: AccumulationType,
         temporal: bool,
-        source_columns: dict[DataSource, str] | None = None,
+        source_columns: dict[DataSource, str],
         presence_check: bool = False,
         categories: list | None = None,
         embedding_dim: int | None = None,
@@ -73,13 +76,14 @@ class FeatureSpec:
 
         Args:
             name: Feature name, used as the global output column identifier.
-            feature_provider: Data source this feature originates from.
             feature_type: Statistical type of the feature.
             scaling_mode: How the feature will be scaled before model input.
             accumulation: How the ingester accumulates this feature across gameweeks.
             temporal: Whether the feature varies over time.
             source_columns: Mapping of provider to raw column name,
-                e.g. {DataSource.VAASTAV: "goals_scored"}.
+                e.g. {DataSource.VAASTAV: "goals_scored"}. Every feature must
+                have at least one entry. SEQUENCER features use
+                {DataSource.SEQUENCER: "<feature_name>"}.
             presence_check: If True, a feature value equal to min_value indicates
                 missing data rather than a genuine zero.
             categories: Category list for categorical features.
@@ -90,7 +94,6 @@ class FeatureSpec:
             scaling_params: Fitted scaling parameters [p1, p2]; populated after scaling.
         """
         self.name = name
-        self.feature_provider = feature_provider
         self.feature_type = feature_type
         self.scaling_mode = scaling_mode
         self.temporal = temporal
@@ -103,9 +106,7 @@ class FeatureSpec:
         self.min_value = min_value
         self.period = period
 
-        # avoid mutable defaults
-        # {DataSource: raw_column_name}
-        self.source_columns = source_columns if source_columns is not None else {}
+        self.source_columns = source_columns
         # fitted scaling parameters [p1, p2]
         self.scaling_params = scaling_params if scaling_params is not None else [None, None]
 
@@ -117,6 +118,21 @@ class FeatureSpec:
  
     def _validate(self):
         """Validate feature spec fields, raising ValueError on misconfiguration."""
+        # every feature must have at least one source column
+        if not self.source_columns:
+            raise ValueError(
+                f"{self.name}: source_columns must be non-empty — "
+                f"every feature needs at least one provider mapping."
+            )
+
+        # sequencer features must not be accumulated
+        if DataSource.SEQUENCER in self.source_columns:
+            if self.accumulation != AccumulationType.NONE:
+                raise ValueError(
+                    f"{self.name}: SEQUENCER feature must have accumulation=NONE — "
+                    f"sequencer features are not accumulated across gameweeks."
+                )
+
         # periodic features require given period
         if self.feature_type == FeatureType.PERIODIC:
             if self.period is None:
@@ -130,8 +146,8 @@ class FeatureSpec:
             if not math.isfinite(self.max_value):
                 raise ValueError(f"max_value must be finite, received {self.max_value}.")
             # max_value must be non-zero
-            if abs(self.max_value) < self.eps:
-                raise ValueError(f"max_value must be non-zero (abs < eps={self.eps}), received {self.max_value}.")
+            if abs(self.max_value) < _EPS:
+                raise ValueError(f"max_value must be non-zero (abs < eps={_EPS}), received {self.max_value}.")
 
         # categorical feature requires categories
         if self.feature_type == FeatureType.CATEGORICAL:
@@ -177,6 +193,16 @@ class FeatureSpec:
         """True if this feature is accumulated across gameweeks (PER_90 or RAW_CUMULATIVE)."""
         return self.accumulation != AccumulationType.NONE
 
+    @property
+    def providers(self) -> set[DataSource]:
+        """Set of data sources that can supply this feature."""
+        return set(self.source_columns.keys())
+
+    @property
+    def is_sequencer(self) -> bool:
+        """True if this feature is stamped by the sequencer, not loaded from CSV."""
+        return DataSource.SEQUENCER in self.source_columns
+
 
 class Features:
     """
@@ -186,7 +212,7 @@ class Features:
     the ingestion, scaling, and encoding pipeline.
     """
 
-    def __init__(self, specs: list[FeatureSpec], eps=1e-8):
+    def __init__(self, specs: list[FeatureSpec]):
         """
         Initialise Features from a list of FeatureSpec objects.
 
@@ -197,7 +223,6 @@ class Features:
         # tuple makes immutable after initialisation
         self.specs = tuple(specs)
 
-        self.eps = eps
         self._validate()
 
         # prebuild lookup
@@ -222,28 +247,6 @@ class Features:
 
         cum_cols = []
         for s in self.specs:
-       # --- Pipeline Wiring Guards ---
-
-            # every data-sourced feature must have source_columns wired up.
-            if s.feature_provider in EXTERNAL_DATA_SOURCES and not s.source_columns:
-                raise ValueError(
-                    f"{s.name}: non-SEQUENCER feature (provider={s.feature_provider.value}) "
-                    f"must have source_columns mapping — otherwise the ingester cannot load it."
-                )
-
-            # sequencer features must NOT have source_columns or accumulation.
-            if s.feature_provider == DataSource.SEQUENCER:
-                if s.source_columns:
-                    raise ValueError(
-                        f"{s.name}: SEQUENCER feature must not have source_columns — "
-                        f"it is stamped at sequence-build time, not loaded from CSV."
-                    )
-                if s.accumulation != AccumulationType.NONE:
-                    raise ValueError(
-                        f"{s.name}: SEQUENCER feature must have accumulation=NONE — "
-                        f"sequencer features are not accumulated across gameweeks."
-                    )
-
             # cumulative column uniqueness
             if s.cum_col is not None:
                cum_cols.append(s.cum_col)
@@ -268,7 +271,7 @@ class Features:
         """Feature names present before sequencer stamping, excluding SEQUENCER-sourced features."""
         return [
             s.name for s in self.specs
-            if s.feature_provider != DataSource.SEQUENCER
+            if not s.is_sequencer
         ]
 
     @cached_property
@@ -276,13 +279,13 @@ class Features:
         """Feature names stamped by the sequencer at sequence-build time; not loaded from CSV."""
         return [
             s.name for s in self.specs
-            if s.feature_provider == DataSource.SEQUENCER
+            if s.is_sequencer
         ]
 
     @cached_property
     def fixture_columns(self) -> list[str]:
         """Feature names that come from fixture information"""
-        return [s.name for s in self.specs if s.feature_provider == DataSource.FIXTURE]
+        return [s.name for s in self.specs if DataSource.FIXTURE in s.source_columns]
 
     @cached_property
     def temporal_columns(self) -> list[str]:
@@ -523,10 +526,11 @@ class Features:
 
     @property
     def specs_by_provider(self) -> dict[DataSource, list[FeatureSpec]]:
-        """Group specs by their feature_provider field."""
+        """Group specs by provider; a multi-provider feature appears under each."""
         result: dict[DataSource, list[FeatureSpec]] = {}
         for s in self.specs:
-            result.setdefault(s.feature_provider, []).append(s)
+            for provider in s.source_columns:
+                result.setdefault(provider, []).append(s)
         return result
 
     #================================================
@@ -569,7 +573,6 @@ class Features:
         return [
             {
                 "name": s.name,
-                "feature_provider": s.feature_provider.value,
                 "feature_type": s.feature_type.value,
                 "scaling_mode": s.scaling_mode.value,
                 "accumulation": s.accumulation.value,
@@ -599,16 +602,25 @@ class Features:
         """
         specs = []
         for d in data:
+            # backwards compat: old JSON may have feature_provider but no source_columns
+            source_columns = {
+                DataSource(k): v
+                for k, v in d.get("source_columns", {}).items()
+            }
+            if not source_columns and "feature_provider" in d:
+                provider = DataSource(d["feature_provider"])
+                if provider == DataSource.SEQUENCER:
+                    source_columns = {DataSource.SEQUENCER: d["name"]}
+
             specs.append(
                 FeatureSpec(
                     name=d["name"],
-                    feature_provider=DataSource(d["feature_provider"]),
                     feature_type=FeatureType(d["feature_type"]),
                     scaling_mode=ScalingMode(d["scaling_mode"]),
                     accumulation=AccumulationType(d.get("accumulation", "none")),
                     scaling_params=d["scaling_params"],
                     temporal=d["temporal"],
-                    source_columns={DataSource(k): v for k, v in d.get("source_columns", {}).items()},
+                    source_columns=source_columns,
                     presence_check=d["presence_check"],
                     categories=d["categories"],
                     embedding_dim=d["embedding_dim"],

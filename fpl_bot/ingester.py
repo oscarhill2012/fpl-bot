@@ -28,6 +28,7 @@ class FPLSourceConfig:
     other_games: bool                                   # if dataset contains non-EPL matches, is True
     gw_col: str | None                                  # which col has the GW number
     gw_path: str | None                                 # path pattern for per-GW files
+    gw_filename: str | None                              # per-GW CSV filename (e.g. "playerstats.csv")
     transform: dict[str, Callable[[str], Any]] | None   # transform feature
 
 @dataclass
@@ -307,7 +308,7 @@ class GameweekProvider:
             # returns a view, so copy
             gw_data = self._stacked_data[self._stacked_data[self.cfg.gw_col] == gw].copy()
         else:
-            gw_data = pd.read_csv(self.season_root + f"GW{gw}/playermatchstats.csv")
+            gw_data = pd.read_csv(self.season_root + f"GW{gw}/{self.cfg.gw_filename}")
 
         return gw_data
     
