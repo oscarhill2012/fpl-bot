@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .features import Features, FeatureSpec, FeatureType
+from .features import Features, FeatureSpec, FeatureType, DataSource
 from .player_team_index import player_team_index
 
 logger = logging.getLogger(__name__)
@@ -127,9 +127,10 @@ class PriorComputer:
         self._validate_input()
 
         self.features = features
-        self.cumulative_cols = features.cumulative_columns
-        self.per_90_cols = features.per_90_columns
-        self.snapshot_cols = features.snapshot_columns
+        self.output_columns = features.pre_seq_columns_for([DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV])
+        self.cumulative_cols = features.cumulative_columns_for([DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV])
+        self.per_90_cols = features.per_90_columns_for([DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV])
+        self.snapshot_cols = features.snapshot_columns_for([DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV])
         self.cum_rev_map = features.inv_cumulative_map
 
         if player_meta.index.name != "player_team_id":
@@ -342,7 +343,7 @@ class PriorComputer:
         combined = pd.concat([per_90, snapshots, cum_df[["minutes", "mins_over_featured_var"]]], axis=1)
 
         # ensure combined has columns ordered by convention
-        combined = combined[self.features.pre_sequencer_columns]
+        combined = combined[self.output_columns]
 
         # output dict
         return self._output_df_to_dict(combined)

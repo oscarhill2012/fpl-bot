@@ -224,16 +224,21 @@ class GameweekProvider:
 
         # generate snapshot, cumulative and output column names for provider
         # copy lists to avoid mutating the cached properties on the shared Features object
-        self.snapshot_cols = features.snapshot_columns_for(self.cfg.provider)
-        self.cumulative_cols = list(features.cumulative_columns_for(self.cfg.provider))
-        self.output_cols = list(features.pre_sequencer_columns)
+        self.snapshot_cols = features.snapshot_columns_for([self.cfg.provider])
+        self.cumulative_cols = list(features.cumulative_columns_for([self.cfg.provider]))
 
-        # we add featured column, we want it to be cumulative (but not per_90) and be outputted
-        self.output_cols.append("featured")
+        # provider_cols: features this provider loads from CSV (used for numeric coercion)
+        self._provider_cols = list(features.pre_seq_columns_for([self.cfg.provider]))
+
+        # output_cols: provider_cols + synthesised columns like "featured"
+        # NOTE: bit bodge, but featured is internal only feature, so doesnt really fit into FeatureSpecs
+        self.output_cols = self._provider_cols + ["featured"]
         self.cumulative_cols.append("featured")
+        self.cum_map["featured"] = "cum_featured"
+        self.cum_rev_map["cum_featured"] = "featured"
 
         # columns that will get per_90 rate (subtly different to cumulative_cols as these contain "minutes")
-        self.per_90_cols = features.per_90_columns_for(self.cfg.provider)
+        self.per_90_cols = features.per_90_columns_for([self.cfg.provider])
 
     #================================================
     # Public Functions
@@ -267,7 +272,7 @@ class GameweekProvider:
         gw_data = self._load_raw(gw)
 
         # validate dataframe
-        self.features.validate_dataframe_from(gw_data, self.cfg.provider, f"GW{gw}")
+        self.features.validate_dataframe_from(gw_data, list(self.cfg.col_map.keys()), f"GW{gw}")
 
         gw_data = self._match_filter(gw_data, self.cfg.denotes_epl, f"GW{gw}")
 
@@ -275,7 +280,8 @@ class GameweekProvider:
         gw_data = gw_data.rename(columns=self.cfg.player_id | self.cfg.col_map)
 
         # coerce all output columns to numeric (real data may have string-typed floats)
-        gw_data = self._force_numeric_cols(gw_data, self.output_cols)
+        # exclude "featured" — it is synthesised by _add_featured_col, not loaded from CSV
+        gw_data = self._force_numeric_cols(gw_data, self._provider_cols)
 
         # featured = 1 if player has mins > 0, this will useful for averaging in priors
         gw_data = self._add_featured_col(gw_data)
@@ -308,7 +314,8 @@ class GameweekProvider:
             # returns a view, so copy
             gw_data = self._stacked_data[self._stacked_data[self.cfg.gw_col] == gw].copy()
         else:
-            gw_data = pd.read_csv(self.season_root + f"GW{gw}/{self.cfg.gw_filename}")
+            prefix = self.cfg.gw_path or ""
+            gw_data = pd.read_csv(self.season_root + prefix + f"GW{gw}/{self.cfg.gw_filename}")
 
         return gw_data
     
@@ -356,7 +363,7 @@ class GameweekProvider:
             .reset_index()                                          # reset index from .groupby
             .merge(self.cfg.id_map, on="player_id", how="right")    # add all players (including those who didnt play),
             .fillna(0.0)                                            # setting all stats 0 if they didn't feature
-            .assign(player_team_index)                              # adds column "{player_code}_{team_code}"
+            .assign(player_team_id=player_team_index)               # adds column "{player_code}_{team_code}"
             .set_index("player_team_id")                            # indexes by new composite index column
             .filter(items=self.output_cols)                         # select only output columns
             .astype(float)                                          # cast all columns as float, player_code safe as index
@@ -570,7 +577,11 @@ class Ingester:
             self.opta_provider.cumulative_gw_data,
         )
         # ensure that gw_combined has columns ordered by convention
-        gw_combined = gw_combined[self.features.pre_sequencer_columns]
+        gw_combined = gw_combined[
+            self.features.pre_seq_columns_for(
+                [self.fpl_provider.cfg.provider, self.opta_provider.cfg.provider]
+            )
+        ]
 
         self._update_first_gw(gw_combined, gw)
         return gw_combined, gw_cum_combined

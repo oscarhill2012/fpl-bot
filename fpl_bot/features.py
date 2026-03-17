@@ -216,12 +216,18 @@ class Features:
         """
         Initialise Features from a list of FeatureSpec objects.
 
+        Specs are auto-sorted so all non-categorical features come first,
+        followed by all categorical features. Relative order within each
+        group is preserved.
+
         Args:
-            specs: Ordered list of feature specifications. Order determines tensor column order.
-            eps: Small epsilon used for numerical stability in validation.
+            specs: List of feature specifications. Will be reordered so
+                categoricals come last before freezing.
         """
-        # tuple makes immutable after initialisation
-        self.specs = tuple(specs)
+        # auto-sort: continuous specs first, categorical specs last
+        continuous = [s for s in specs if s.feature_type != FeatureType.CATEGORICAL]
+        categorical = [s for s in specs if s.feature_type == FeatureType.CATEGORICAL]
+        self.specs = tuple(continuous + categorical)
 
         self._validate()
 
@@ -289,13 +295,23 @@ class Features:
 
     @cached_property
     def temporal_columns(self) -> list[str]:
-        """Feature names that feed into x_temporal; order matches self.specs for stable tensor indexing."""
-        return [s.name for s in self.specs if s.temporal]
+        """Feature names for continuous (non-categorical) features; defines the scaled tensor columns."""
+        return [s.name for s in self.specs if s.feature_type != FeatureType.CATEGORICAL]
 
     @cached_property
     def categorical_columns(self) -> list[str]:
-        """Feature names that feed into x_categorical as embedded integer indices."""
-        return [s.name for s in self.specs if not s.temporal]
+        """Feature names for categorical features; fed into nn.Embedding as integer indices."""
+        return [s.name for s in self.specs if s.feature_type == FeatureType.CATEGORICAL]
+
+    @cached_property
+    def continuous_indices(self) -> list[int]:
+        """Indices into specs for non-CATEGORICAL features."""
+        return [i for i, s in enumerate(self.specs) if s.feature_type != FeatureType.CATEGORICAL]
+
+    @cached_property
+    def categorical_indices(self) -> list[int]:
+        """Indices into specs for CATEGORICAL features."""
+        return [i for i, s in enumerate(self.specs) if s.feature_type == FeatureType.CATEGORICAL]
 
     @cached_property
     def snapshot_columns(self) -> list[str]:
@@ -322,26 +338,29 @@ class Features:
     # Column lists narrowed to features supplied by a specific DataSource.
     #================================================
 
-    def _columns_for(self, base_list: list[str], provider: DataSource) -> list[str]:
+    def _columns_for(self, base_list: list[str], providers: list[DataSource]) -> list[str]:
         """
-        Helper: Filter any column list to only those supplied by a given provider.
+        Helper: Filter any column list to only those supplied by given providers.
 
         Args:
             base_list: List of output column names to filter.
-            provider: DataSource to filter by.
+            providers: DataSources to filter by.
 
         Returns:
-            Subset of base_list where the provider has a non-None source column.
+            Subset of base_list where any provider has a non-None source column.
         """
         return [
             name for name in base_list
-            if provider in self._spec_by_name[name].source_columns
-            and self._spec_by_name[name].source_columns[provider] is not None
-        ]
+            if any(
+                provider in self._spec_by_name[name].source_columns
+                and self._spec_by_name[name].source_columns[provider] is not None
+                for provider in providers
+            )
+        ] 
 
-    def source_columns_for(self, provider: DataSource) -> list[str]:
+    def pre_seq_columns_for(self, providers: list[DataSource]) -> list[str]:
         """
-        Source columns names supplied by a given provider.
+        Pre-Sequencer column names supplied by a given provider.
 
         Args:
             provider: DataSource to filter by.
@@ -349,13 +368,9 @@ class Features:
         Returns:
             Source column names available for that provider.
         """
-        return [
-            s.source_columns[provider] for s in self.specs
-            if provider in s.source_columns
-            and s.source_columns[provider] is not None
-        ]
+        return self._columns_for(self.output_columns, providers)
 
-    def categorical_columns_for(self, provider: DataSource) -> list[str]:
+    def categorical_columns_for(self, providers: list[DataSource]) -> list[str]:
         """
         Categorical output column names supplied by a given provider.
 
@@ -365,9 +380,9 @@ class Features:
         Returns:
             Categorical column names available for that provider.
         """
-        return self._columns_for(self.categorical_columns, provider)
+        return self._columns_for(self.categorical_columns, providers)
 
-    def cumulative_columns_for(self, provider: DataSource) -> list[str]:
+    def cumulative_columns_for(self, providers: list[DataSource]) -> list[str]:
         """
         Cumulative output column names supplied by a given provider.
 
@@ -377,9 +392,9 @@ class Features:
         Returns:
             Cumulative column names available for that provider.
         """
-        return self._columns_for(self.cumulative_columns, provider)
+        return self._columns_for(self.cumulative_columns, providers)
 
-    def per_90_columns_for(self, provider: DataSource) -> list[str]:
+    def per_90_columns_for(self, providers: list[DataSource]) -> list[str]:
         """
         Per-90-rate output column names supplied by a given provider.
 
@@ -389,9 +404,9 @@ class Features:
         Returns:
             Per-90 column names available for that provider.
         """
-        return self._columns_for(self.per_90_columns, provider)
+        return self._columns_for(self.per_90_columns, providers)
 
-    def snapshot_columns_for(self, provider: DataSource) -> list[str]:
+    def snapshot_columns_for(self, providers: list[DataSource]) -> list[str]:
         """
         Snapshot output column names supplied by a given provider.
 
@@ -401,7 +416,7 @@ class Features:
         Returns:
             Snapshot column names available for that provider.
         """
-        return self._columns_for(self.snapshot_columns, provider)
+        return self._columns_for(self.snapshot_columns, providers)
 
     #================================================
     # Column Mapping Dicts
@@ -538,7 +553,7 @@ class Features:
     # Runtime checks on DataFrames against the feature spec.
     #================================================
 
-    def validate_dataframe_from(self, df: pd.DataFrame, provider: DataSource, context: str = "") -> None:
+    def validate_dataframe_from(self, df: pd.DataFrame, expected_cols: list[str], context: str = "") -> None:
         """
         Check that a DataFrame from a provider contains the expected columns.
 
@@ -546,17 +561,18 @@ class Features:
 
         Args:
             df: DataFrame to validate.
-            provider: DataSource whose source columns define the expected set.
+            expected_cols: input list to check df against
             context: Optional label for error messages, e.g. "GW1".
         """
-        expected = set(self.source_columns_for(provider))
+        
+        expected = set(expected_cols)
         actual = set(df.columns)
         missing = expected - actual
-        extra = actual - expected
+#        extra = actual - expected
         if missing:
             raise ValueError(f"{context} missing columns: {sorted(missing)}")
-        if extra:
-            logger.warning(f"{context} has extra columns not in Features: {sorted(extra)}")
+#        if extra:
+#            logger.warning(f"{context} has extra columns not in Features: {sorted(extra)}")
 
     #================================================
     # Serialisation

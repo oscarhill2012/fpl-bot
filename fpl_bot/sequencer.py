@@ -15,13 +15,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# Position strings → integer indices for categorical embedding.
-# 0 is reserved as a padding index (used when position is unknown or
-# for the padding_idx argument of nn.Embedding, which zeros out the
-# gradient for that index so the model doesn't learn from empty slots).
-_POSITION_TO_IDX = {"GKP": 1, "DEF": 2, "MID": 3, "FWD": 4}
-
-
 class SeasonSequencer:
     """
     Stateful orchestrator for one season of FPL data.
@@ -70,10 +63,7 @@ class SeasonSequencer:
         self._ingester = Ingester(features, season_root, fpl_config_season, opta_config, fixture_config)
         self._window_size = window_size
 
-        # generate list of categorical and temporal features
         self.features = features
-        self._temporal_features = features.temporal_columns
-        self._categorical_features = features.categorical_columns
 
         # index by player code for fast lookup
         if player_meta.index.name != "player_team_id":
@@ -105,9 +95,8 @@ class SeasonSequencer:
     # Initialise Helpers
     #================================================
 
-    def _build_prior_fixtures(self) -> "SeasonSequencer":
-        """Fixture data is left blank for priors"""
-
+    def _build_prior_fixtures(self) -> dict[str, int]:
+        """Build blank fixture row for prior timesteps; oppo_team_code defaults to padding index 0."""
         return {
             feature: 0 if feature != "is_home" else 1
             for feature in self.features.fixture_columns
@@ -208,68 +197,73 @@ class SeasonSequencer:
     #================================================
 
     def build_player_window(
-        self, 
-        player_team_id: str, 
-        window: list[int], 
-        inference: bool = False
-        ) -> tuple[np.array, np.array]:
+        self,
+        player_team_id: str,
+        target_gw: int,
+        inference: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Construct a fixed-length sequence of gameweek rows for a single player.
+
+        Builds one unified row per timestep containing all features, then splits
+        into continuous and categorical arrays using Features index masks.
 
         For each timestep, selects either real data or a prior row depending on
         whether the player had appeared in the data by that gameweek.
 
         Args:
             player_team_id: Composite player-team identifier, e.g. "12345_99".
-            window: List of gameweek numbers to include in the sequence.
+            target_gw: gameweek to predict, i.e window ends on target - 1
             inference: Whether the sequence is being built for inference.
 
         Returns:
-            two arrays: temporal feauture, categorical features
+            Tuple of (continuous, categorical) arrays with shapes
+            [window_size, n_continuous] and [window_size, n_categorical].
         """
         position = self._player_meta[player_team_id]["position"]
         team_code = self._player_meta[player_team_id]["team_code"]
         first_gw = self._first_gw[player_team_id]
-        gw_window: list[int] = []
+
+        window = self._build_window(target_gw)
 
         # filter any gameweeks before the player's first appearance
-        # if player hasn't appeared yet first gw = 39 so window = []
-        gw_window[:] = [i for i in window if i >= first_gw]
+        # if player hasn't appeared yet first_gw = 39 so gw_window = []
+        gw_window = [i for i in window if i >= first_gw]
 
-        # window must always be len self._window_size, 0 in window => prior row
+        # pad to window_size with 0s (prior rows) at the front
         n_pad = self._window_size - len(gw_window)
         gw_window[:0] = [0] * n_pad
 
+        # pre-fetch prior row if any padding needed
         if n_pad != 0:
-            temporal_prior_row = self._get_prior(player_team_id, team_code, position)
-            # blank fixtures row is cached at gw=0
-            temporal_prior_row.update(self.fixture_cache[0])
-            # optional guard
-            self._verify_consistent_features(list(temporal_prior_row.keys()), self._temporal_features + ["is_prior", "data_age"])
+            prior_row = self._get_prior(player_team_id, str(team_code), str(position))
+            prior_row.update(self.fixture_cache[0])
 
-        # list of categorical features
-        categorical_row = list(self._player_meta[player_team_id].values())
+        # static categorical codes, constant across timesteps
+        position_idx = self._player_meta[player_team_id]["position_idx"]
+        output_columns = self.features.output_columns
 
-        temporal_list = []
-        categorical_list = []
+        unified_rows = []
         for i, gw in enumerate(gw_window):
-            # categorical stays same for each gw by definition
-            categorical_list.append(categorical_row)
-
-            # 0 => prior
             if gw == 0:
-                temporal_prior_row["data_age"] = self._window_size - i
-                temporal_list.append(list(temporal_prior_row.values()))
-                
+                prior_row["data_age"] = self._window_size - i
+                row = dict(prior_row)
             else:
-                temporal_real_row = self._get_real_row(player_team_id, gw)
-                temporal_real_row.update(self.fixture_cache[gw])
-                temporal_list.append(list(temporal_real_row.values()))
-                # optional guard
-                self._verify_consistent_features(list(temporal_real_row.keys()), self._temporal_features + ["is_prior", "data_age"])
+                row = self._get_real_row(player_team_id, gw)
+                row.update(self.fixture_cache[gw][team_code])
 
-        # convert to 2D numpy array, shape [n_timesteps, n_features]
-        return np.array(temporal_list, dtype=np.float32), np.array(categorical_list, dtype=np.int32)
+            # categorical codes from player meta and fixture data
+            row["position"] = position_idx
+            row["team_code"] = team_code
+
+            unified_rows.append([row[col] for col in output_columns])
+
+        # split unified array into continuous and categorical using index masks
+        full = np.array(unified_rows, dtype=np.float64)
+        continuous = full[:, self.features.continuous_indices].astype(np.float32)
+        categorical = full[:, self.features.categorical_indices].astype(np.int32)
+
+        return continuous, categorical
         
         
     #================================================
@@ -323,8 +317,3 @@ class SeasonSequencer:
         real_row["is_prior"], real_row["data_age"] = 0.0, 0.0
         return real_row
 
-    def _verify_consistent_features(self, list1: list[str], list2: list[str]) -> "SeasonSequencer":
-        """Raise RuntimeError if two feature name lists differ."""
-        if list1 != list2:
-            raise RuntimeError("Inconsistent features between prior and current data")
-        return self

@@ -118,7 +118,7 @@ def _build_specs(team_codes: list[int]) -> list[FeatureSpec]:
 
         feature_type=FeatureType.BINARY,
         scaling_mode=ScalingMode.IDENTITY,
-        accumulation=AccumulationType.RAW_CUMULATIVE,
+        accumulation=AccumulationType.NONE,
         temporal=True,
         source_columns={DataSource.VAASTAV: "starts", DataSource.FCI: "starts"},
     ),
@@ -752,7 +752,7 @@ def _build_specs(team_codes: list[int]) -> list[FeatureSpec]:
         feature_type=FeatureType.CATEGORICAL,
         scaling_mode=ScalingMode.IDENTITY,
         accumulation=AccumulationType.NONE,
-        temporal=False,
+        temporal=True,
         source_columns={DataSource.FIXTURE: "oppo_team_code"},
         categories=team_codes,
         embedding_dim=8,
