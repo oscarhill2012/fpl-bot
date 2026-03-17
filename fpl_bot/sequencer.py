@@ -1,17 +1,18 @@
 from __future__ import annotations
+
+import logging
 import math
+
 import numpy as np
 import pandas as pd
 import torch
-
 from torch.utils.data import Dataset
-from .ingester import Ingester, FPLSourceConfig, FixtureSourceConfig
-from .priors import PriorComputer, PriorData
+
 from .features import Features, FeatureSpec, FeatureType
+from .ingester import Ingester, FPLSourceConfig, FixtureSourceConfig
 from .player_team_index import player_team_index
+from .priors import PriorComputer, PriorData
 
-
-import logging
 logger = logging.getLogger(__name__)
 
 
@@ -53,8 +54,8 @@ class SeasonSequencer:
             opta_config: Source configuration for the Opta data provider.
             player_meta: DataFrame indexed by player_team_code with columns
                 including 'position' and 'team_code'.
-            fixture_df: DataFrame of fixtures for the season.
-            teams_df: DataFrame of team strength and ELO data.
+            fixture_config: Source configuration for fixture data.
+            teams_df: DataFrame of team strength and Elo data.
             window_size: Number of past gameweeks to include in each sequence.
             prior_data: Pre-computed prior data; if None, computed from the
                 first ingest_range() call.
@@ -178,19 +179,6 @@ class SeasonSequencer:
         return self
 
     #================================================
-    # Private Helpers
-    #================================================
-
-    def _cache_gw(self, gw: int) -> "SeasonSequencer":
-        """Convert the ingested DataFrame for a gameweek to a nested dict for fast lookup."""
-
-        self.player_cache[gw] = self._ingester.player_gw_stats[gw].to_dict(orient="index")
-        self.fixture_cache[gw] = self._ingester.fixtures[gw].to_dict(orient="index")
-
-        return self
-
-
-    #================================================
     # Sequence Construction
     # Methods that build fixed-length player sequences
     # from cached gameweek data and prior estimates.
@@ -260,7 +248,7 @@ class SeasonSequencer:
 
         # split unified array into continuous and categorical using index masks
         full = np.array(unified_rows, dtype=np.float64)
-        continuous = full[:, self.features.continuous_indices].astype(np.float32)
+        continuous = full[:, self.features.continuous_indices].astype(np.float32).round(3)
         categorical = full[:, self.features.categorical_indices].astype(np.int32)
 
         return continuous, categorical
@@ -269,6 +257,13 @@ class SeasonSequencer:
     #================================================
     # Private Helpers
     #================================================
+
+    def _cache_gw(self, gw: int) -> "SeasonSequencer":
+        """Convert the ingested DataFrame for a gameweek to a nested dict for fast lookup."""
+        self.player_cache[gw] = self._ingester.player_gw_stats[gw].to_dict(orient="index")
+        self.fixture_cache[gw] = self._ingester.fixtures[gw].to_dict(orient="index")
+
+        return self
 
     def _build_window(self, target_gw: int) -> list[int]:
         """Build the list of gameweeks in the sliding window ending before target_gw."""
@@ -280,7 +275,7 @@ class SeasonSequencer:
     def _get_prior(self, player_team_id: str, team_code: str, position: str) -> dict[str, float]:
         """Look up the best available prior for a player, falling back through the hierarchy."""
         if self._prior_data is None:
-            raise RuntimeError("No prior data available, call ingeste_range() first.")
+            raise RuntimeError("No prior data available, call ingest_range() first.")
 
         pos_team = "_".join([position, team_code])       # NOTE: order is convention
 

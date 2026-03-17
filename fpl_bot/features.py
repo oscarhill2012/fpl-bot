@@ -568,11 +568,8 @@ class Features:
         expected = set(expected_cols)
         actual = set(df.columns)
         missing = expected - actual
-#        extra = actual - expected
         if missing:
             raise ValueError(f"{context} missing columns: {sorted(missing)}")
-#        if extra:
-#            logger.warning(f"{context} has extra columns not in Features: {sorted(extra)}")
 
     #================================================
     # Serialisation

@@ -59,10 +59,10 @@ class _LinearScaler:
     #================================================
 
     @property
-    def get_params(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def params(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Fitted (location, scale) tensors, shape [1, n_scaled_features]; raises RuntimeError if called before fit()."""
         if not self._fitted:
-            raise RuntimeError('Must call fit() before get_params()')
+            raise RuntimeError('Must call fit() before accessing params.')
 
         return self.location, self.scale
         # WARNING: order of output is convention
@@ -115,8 +115,8 @@ class _LinearScaler:
         if self._fitted:
             warnings.warn('You have overwritten scaler params')
         # NAN input will corrupt data
-        if torch.isnan(x).any().item():
-            raise RuntimeError('Scaling parameters contains NAN')
+        if torch.isnan(params).any().item():
+            raise RuntimeError('Scaling parameters contain NaN')
 
         self.location = params[0, :].to(self.device)
         self.scale = params[1, :].to(self.device)
@@ -145,7 +145,7 @@ class _LinearScaler:
             warnings.warn('You have overwritten scaler params')
         # NAN input will corrupt data
         if torch.isnan(params).any().item():
-            raise RuntimeError('Scaling parameters contains NAN')
+            raise RuntimeError('Scaling parameters contain NaN')
 
         self.location = params[0, :].to(self.device)
         self.scale = params[1, :].to(self.device)
@@ -253,7 +253,7 @@ class _LogScaler(_LinearScaler):
 
     def _inverse_transform_input(self, x: torch.Tensor) -> torch.Tensor:
         """Apply e^x - 1 to reverse the log transform."""
-        # e^(x-1)
+        # e^x - 1
         return torch.expm1(x)
 
 
@@ -395,12 +395,12 @@ class _BoundedScaler(_LinearScaler):
     #================================================
 
     @property
-    def get_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def params(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Min and max scaling parameters (min_value, max_value); redundant but present for interface consistency."""
         # redundant, as cannot call params without user inputs min and max,
         # but required for interface consistency when storing params for all scalers
         if not self._fitted:
-            raise RuntimeError('Must call fit() before get_params()')
+            raise RuntimeError('Must call fit() before accessing params.')
 
         return self.min_value, self.max_value
         # WARNING: order of output is convention
@@ -478,8 +478,8 @@ class _BoundedScaler(_LinearScaler):
         # params must be shape [1, n_scaled_features]
         if not x.shape[-1] == params.shape[-1]:
             raise ValueError('Params and Data must both be same n_features')
-        if torch.isnan(x).any().item():
-            raise RuntimeError('Scaling parameters contains NAN')
+        if torch.isnan(params).any().item():
+            raise RuntimeError('Scaling parameters contain NaN')
 
         self.min_value = params[0, :].to(self.device)
         self.max_value = params[1, :].to(self.device)
@@ -602,7 +602,7 @@ class FeatureScaler:
         x_present = x[presence_mask]
         for mode, scaler in self._scalers.items():
             x_present[:, self.scaling_masks[mode]] = scaler.fit_transform(x_present[:, self.scaling_masks[mode]])
-            param1, param2 = scaler.get_params
+            param1, param2 = scaler.params
 
             for spec, p1, p2 in zip(self.specs_by_mode[mode], param1[0], param2[0], strict=True):
                 spec.scaling_params = [p1.item(), p2.item()]
@@ -713,7 +713,6 @@ class FeatureScaler:
         # None makes bound scaler set to 0s
         if not max_vals:
             self.max_vals = None
-        if not min_vals:
             self.min_vals = None
             return self
 

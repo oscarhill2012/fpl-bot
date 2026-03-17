@@ -11,6 +11,25 @@ from .player_team_index import player_team_index
 
 logger = logging.getLogger(__name__)
 
+
+def _match_filter(
+    gw_data: pd.DataFrame,
+    other_games: bool,
+    identifier: dict[str, str],
+    context: str = "",
+) -> pd.DataFrame:
+    """Filter DataFrame rows where the identifying column contains the expected string."""
+    if other_games:
+        for col, string in identifier.items():
+            # regex=False ensures string can contain special characters
+            gw_data = gw_data[gw_data[col].str.contains(string, regex=False)]
+
+    if gw_data.empty:
+        logger.warning(f"{context}: no data left after filtering for EPL")
+
+    return gw_data
+
+
 @dataclass
 class FPLSourceConfig:
     """
@@ -47,6 +66,7 @@ class FixtureSourceConfig:
     other_games: bool                                   # if dataset contains non-EPL matches, is True
     gw_col: str | None                                  # which col has the GW number
     gw_path: str | None                                 # path pattern for per-GW files
+    gw_filename: str                                    # per-GW CSV filename (e.g. "matches.csv")
 
 
 class FixtureProvider:
@@ -85,10 +105,10 @@ class FixtureProvider:
         """
         # rename columns so they end at team_code when processing
         raw_fixtures = (
-            pd.read_csv(self.season_root + self.cfg.gw_path + f"GW{gw}/matches.csv")
+            pd.read_csv(self.season_root + self.cfg.gw_path + f"GW{gw}/{self.cfg.gw_filename}")
             .rename(columns={"home_team": "home_team_code", "away_team": "away_team_code"})
         )
-        raw_fixtures = self._match_filter(raw_fixtures, self.cfg.denotes_epl, f"GW{gw}")
+        raw_fixtures = _match_filter(raw_fixtures, self.cfg.other_games, self.cfg.denotes_epl, f"GW{gw}")
         
         # dataset gives one row per game (teams are home and away)
         # we want one row per team, so we need to split and rename columns
@@ -121,22 +141,9 @@ class FixtureProvider:
     # Private Helpers
     #================================================   
 
-    def _match_filter(self, gw_data: pd.DataFrame, identifier: dict[str, str], context: str = "") -> pd.DataFrame:
-        """If multiple matches, filter DataFrame rows for key column contains value string."""
-        if self.cfg.other_games:
-            for col, string in identifier.items():
-                # regex ensures string can contain special characters
-                gw_data = gw_data[gw_data[col].str.contains(string, regex=False)]
-
-        # if empty, filter is likely wrong, warn user of this
-        if gw_data.empty:
-            logger.warning(f"{context}: no data left after filtering for EPL")
-
-        return gw_data
-
     @staticmethod
     def _home_away_split(gw_fixtures: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Seperate home and away features, into two dfs"""
+        """Separate home and away features into two DataFrames."""
         home_columns = [col for col in gw_fixtures.columns if "home" in col]
         away_columns = [col for col in gw_fixtures.columns if "away" in col]
 
@@ -169,7 +176,7 @@ class FixtureProvider:
         )
         away_combined = pd.concat([away_own, away_oppo], axis=1)
 
-        return home_combined, away_combined
+        return home_combined.copy(), away_combined.copy()
     
     @staticmethod
     def _add_is_home(home_df: pd.DataFrame, away_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -229,7 +236,7 @@ class GameweekProvider:
 
         # provider_cols: features this provider loads from CSV (used for numeric coercion)
         self._provider_cols = list(features.pre_seq_columns_for([self.cfg.provider]))
-
+        
         # output_cols: provider_cols + synthesised columns like "featured"
         # NOTE: bit bodge, but featured is internal only feature, so doesnt really fit into FeatureSpecs
         self.output_cols = self._provider_cols + ["featured"]
@@ -274,11 +281,14 @@ class GameweekProvider:
         # validate dataframe
         self.features.validate_dataframe_from(gw_data, list(self.cfg.col_map.keys()), f"GW{gw}")
 
-        gw_data = self._match_filter(gw_data, self.cfg.denotes_epl, f"GW{gw}")
+        gw_data = _match_filter(gw_data, self.cfg.other_games, self.cfg.denotes_epl, f"GW{gw}")
 
-        # rename to output column names
+        gw_data = self._per_90_guard(gw_data)
+
+        # filter output columns, rename to output column names
         gw_data = gw_data.rename(columns=self.cfg.player_id | self.cfg.col_map)
-
+       
+        
         # coerce all output columns to numeric (real data may have string-typed floats)
         # exclude "featured" — it is synthesised by _add_featured_col, not loaded from CSV
         gw_data = self._force_numeric_cols(gw_data, self._provider_cols)
@@ -319,16 +329,11 @@ class GameweekProvider:
 
         return gw_data
     
-    def _match_filter(self, gw_data: pd.DataFrame, identifier: dict[str, str], context: str = "") -> pd.DataFrame:
-        """If multiple matches, filter DataFrame rows for key column contains value string."""
-        if self.cfg.other_games:
-            for col, string in identifier.items():
-                # regex ensures string can contain special characters
-                gw_data = gw_data[gw_data[col].str.contains(string, regex=False)]
-
-        # if empty, filter is likely wrong, warn user of this
-        if gw_data.empty:
-            logger.warning(f"{context}: no data left after filtering for EPL")
+    def _per_90_guard(self, gw_data: pd.DataFrame) -> pd.DataFrame:
+        """Remove any existing per_90 columns so no duplicates arise when we rename."""
+        for cols in gw_data.columns:
+            if "per_90" in cols:
+                gw_data = gw_data.drop(cols, axis=1)
 
         return gw_data
 
@@ -337,7 +342,7 @@ class GameweekProvider:
         missing = set(cols) - set(gw_data.columns)
         if missing:
             raise ValueError(f"Columns {missing} not found in gameweek data.")
-
+        
         # make columns numeric, if can't make 0.0
         gw_data[cols] = gw_data[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 

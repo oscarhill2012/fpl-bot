@@ -158,7 +158,7 @@ def _build_specs(team_codes: list[int]) -> list[FeatureSpec]:
         scaling_mode=ScalingMode.LINEAR,
         accumulation=AccumulationType.NONE,
         temporal=True,
-        source_columns={DataSource.VAASTAV: "total_points", DataSource.FCI: "event_points"},
+        source_columns={DataSource.VAASTAV: "total_points", DataSource.FCI: "total_points"},
     ),
     FeatureSpec(
         name="transfers_in",

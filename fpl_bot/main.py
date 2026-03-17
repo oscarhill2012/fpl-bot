@@ -1,12 +1,12 @@
 """
 End-to-end smoke test for the FPL pipeline.
 
-Wires up Features → Ingester → SeasonSequencer → build_player_window()
+Wires up Features -> Ingester -> SeasonSequencer -> build_player_window()
 on a small GW range to verify the full data path produces valid tensors.
 
 Two seasons are configured:
-    24-25: Vaastav (FPL API) + FCI (Opta) + FCI (fixtures)
-    25-26: FCI (FPL API) + FCI (Opta) + FCI (fixtures)
+    24-25: Vaastav (FPL API) + OPTA + Fixtures
+    25-26: FCI (FPL API) + OPTA + Fixtures
 
 Each season gets its own SeasonSequencer instance.
 """
@@ -17,22 +17,12 @@ import pathlib
 import pandas as pd
 
 from fpl_bot import (
-    FeatureType,
-    ScalingMode,
-    AccumulationType,
     DataSource,
-    FeatureSpec,
     Features,
-    FeatureScaler,
-    Ingester,
-    GameweekProvider,
     FPLSourceConfig,
     FixtureSourceConfig,
     SeasonSequencer,
-    PriorData,
-    PriorComputer,
     build_features,
-    _build_specs,
     player_team_index,
 )
 
@@ -42,19 +32,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Paths ───────────────────────────────────────────────────────────────────
-# Resolve relative to the repo root (one level above fpl-bot/).
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_FPL_DATA = _REPO_ROOT / "Data" / "FPL Data"
+# -- Paths -------------------------------------------------------------------
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_DATA_ROOT = _PROJECT_ROOT / "Data"
 
-DATA_ROOT_24 = _FPL_DATA / "2024-2025"
-SEASON_ROOT_24 = str(DATA_ROOT_24) + "/"
+DATA_ROOT_24 = _DATA_ROOT / "2024-2025"
+DATA_ROOT_25 = _DATA_ROOT / "2025-2026"
 
-DATA_ROOT_25 = _FPL_DATA / "2025-2026"
-SEASON_ROOT_25 = str(DATA_ROOT_25 / "By Gameweek") + "/"
-
-# ── Position mapping ────────────────────────────────────────────────────────
-# players.csv uses full names; the sequencer and priors expect short codes.
+# -- Position mapping ---------------------------------------------------------
+# Player metadata uses full names; the sequencer and priors expect short codes.
 _POSITION_SHORT = {
     "Goalkeeper": "GKP",
     "Defender": "DEF",
@@ -65,7 +51,7 @@ _POSITION_SHORT = {
 
 def _build_player_meta(
     players: pd.DataFrame,
-    features,
+    features: Features,
 ) -> pd.DataFrame:
     """
     Build player metadata DataFrame with position_idx derived from registry.
@@ -75,7 +61,8 @@ def _build_player_meta(
         features: Feature registry used to derive position encoding.
 
     Returns:
-        DataFrame with player_code, player_id, team_code, position, position_idx.
+        DataFrame indexed by player_team_id with player_code, player_id,
+        team_code, position, and position_idx columns.
     """
     meta = players[["player_code", "player_id", "team_code", "position"]].copy()
 
@@ -83,51 +70,94 @@ def _build_player_meta(
     pos_to_idx = {cat: i + 1 for i, cat in enumerate(pos_categories)}
     meta["position_idx"] = meta["position"].map(pos_to_idx)
 
-    return meta
+    return (
+        meta
+        .assign(player_team_id=player_team_index)
+        .set_index("player_team_id")
+    )
 
 
-def _build_season_24(features, id_map, team_codes):
+# =============================================================================
+# Season setup
+# =============================================================================
+
+
+def _setup_season_24(
+    features: Features,
+) -> tuple[str, pd.DataFrame, pd.DataFrame, FPLSourceConfig, FPLSourceConfig, FixtureSourceConfig]:
     """
-    Build configs for the 2024-2025 season.
+    Load metadata and build configs for the 2024-2025 season.
 
-    24-25 uses Vaastav for FPL API data (stacked merged_gw.csv),
-    FCI for Opta (per-GW playermatchstats), and FCI for fixtures.
+    24-25 data is split across three provider folders, each with its own
+    base file for player identity mapping:
+        FPL_API/  -- Vaastav (stacked merged_gw.csv), base: player_idlist.csv
+        OPTA/     -- per-GW playermatchstats, base: players.csv
+        Fixtures/ -- per-GW matches, base: teams.csv
 
     Args:
-        features: Feature registry.
-        id_map: Player identity mapping DataFrame.
-        team_codes: Team codes DataFrame for fixture right-join.
+        features: Feature registry built from this season's team codes.
 
     Returns:
-        Tuple of (vaastav_cfg, opta_cfg, fixture_cfg).
+        Tuple of (season_root, player_meta, teams_df,
+        fpl_cfg, opta_cfg, fixture_cfg).
     """
-    vaastav_map = features.source_map(DataSource.VAASTAV)
-    opta_map = features.source_map(DataSource.OPTA)
+    root = DATA_ROOT_24
+    season_root = str(root) + "/"
 
-    vaastav_cfg = FPLSourceConfig(
+    # -- Provider base files --------------------------------------------------
+    vaastav_base = pd.read_csv(root / "FPL_API" / "player_idlist.csv")
+    opta_base = pd.read_csv(root / "OPTA" / "players.csv")
+    teams = pd.read_csv(root / "Fixtures" / "teams.csv")
+
+    # -- ID maps --------------------------------------------------------------
+    # Each provider gets its own id_map as a guard against mismatched IDs.
+    # Vaastav uses "id" as its player identifier; join with OPTA base to
+    # resolve player_code and team_code.
+    vaastav_id_map = (
+        vaastav_base
+        .rename(columns={"id": "player_id"})
+        .merge(
+            opta_base[["player_id", "player_code", "team_code"]],
+            on="player_id",
+        )
+        [["player_id", "player_code", "team_code"]]
+    )
+    opta_id_map = opta_base[["player_id", "player_code", "team_code"]].copy()
+
+    team_codes_df = teams[["code"]].rename(columns={"code": "team_code"})
+
+    # -- Player metadata ------------------------------------------------------
+    # OPTA base has position; map to short codes for the sequencer.
+    player_meta = opta_base[
+        ["player_code", "player_id", "team_code", "position"]
+    ].copy()
+    player_meta["position"] = player_meta["position"].map(_POSITION_SHORT)
+
+    # -- Source configs -------------------------------------------------------
+    fpl_cfg = FPLSourceConfig(
         provider=DataSource.VAASTAV,
-        col_map=vaastav_map,
+        col_map=features.source_map(DataSource.VAASTAV),
         player_id={"element": "player_id"},
-        id_map=id_map,
+        id_map=vaastav_id_map,
         stacked=True,
         denotes_epl={},
         other_games=False,
         gw_col="GW",
-        gw_path="vaastav/merged_gw.csv",
+        gw_path="FPL_API/merged_gw.csv",
         gw_filename=None,
         transform=None,
     )
 
     opta_cfg = FPLSourceConfig(
         provider=DataSource.OPTA,
-        col_map=opta_map,
+        col_map=features.source_map(DataSource.OPTA),
         player_id={"player_id": "player_id"},
-        id_map=id_map,
+        id_map=opta_id_map,
         stacked=False,
         denotes_epl={"match_id": "prem"},
         other_games=True,
         gw_col=None,
-        gw_path="playermatchstats/",
+        gw_path="OPTA/",
         gw_filename="playermatchstats.csv",
         transform=None,
     )
@@ -135,59 +165,84 @@ def _build_season_24(features, id_map, team_codes):
     fixture_cfg = FixtureSourceConfig(
         provider=DataSource.FIXTURE,
         col_map={},
-        team_codes=team_codes,
+        team_codes=team_codes_df,
         stacked=False,
         denotes_epl={"match_id": "prem"},
         other_games=True,
         gw_col=None,
-        gw_path="matches/",
+        gw_path="Fixtures/",
+        gw_filename="matches.csv",
     )
 
-    return vaastav_cfg, opta_cfg, fixture_cfg
+    return season_root, player_meta, teams, fpl_cfg, opta_cfg, fixture_cfg
 
 
-def _build_season_25(features, id_map, team_codes):
+def _setup_season_25(
+    features: Features,
+) -> tuple[str, pd.DataFrame, pd.DataFrame, FPLSourceConfig, FPLSourceConfig, FixtureSourceConfig]:
     """
-    Build configs for the 2025-2026 season.
+    Load metadata and build configs for the 2025-2026 season.
 
-    25-26 uses FCI for everything: FPL API data, Opta, and fixtures.
-    All files live under By Gameweek/GW{n}/.
+    25-26 uses a single provider (FCI) with all files under GW{n}/:
+        player_gameweek_stats.csv  -- FPL API data
+        playermatchstats.csv       -- OPTA data
+        fixtures.csv               -- fixture data
+
+    Player and team metadata live in the season root folder.
 
     Args:
-        features: Feature registry.
-        id_map: Player identity mapping DataFrame.
-        team_codes: Team codes DataFrame for fixture right-join.
+        features: Feature registry built from this season's team codes.
 
     Returns:
-        Tuple of (fci_cfg, opta_cfg, fixture_cfg).
+        Tuple of (season_root, player_meta, teams_df,
+        fpl_cfg, opta_cfg, fixture_cfg).
     """
-    fci_map = features.source_map(DataSource.FCI)
-    opta_map = features.source_map(DataSource.OPTA)
+    root = DATA_ROOT_25
+    season_root = str(root) + "/"
 
-    fci_cfg = FPLSourceConfig(
+    # -- Metadata -------------------------------------------------------------
+    players = pd.read_csv(root / "players.csv")
+    teams = pd.read_csv(root / "teams.csv")
+
+    # -- ID maps --------------------------------------------------------------
+    # Both FPL API and OPTA share the same players.csv for this season.
+    # Separate copies as a guard against accidental mutation.
+    fci_id_map = players[["player_id", "player_code", "team_code"]].copy()
+    opta_id_map = players[["player_id", "player_code", "team_code"]].copy()
+
+    team_codes_df = teams[["code"]].rename(columns={"code": "team_code"})
+
+    # -- Player metadata ------------------------------------------------------
+    player_meta = players[
+        ["player_code", "player_id", "team_code", "position"]
+    ].copy()
+    player_meta["position"] = player_meta["position"].map(_POSITION_SHORT)
+
+    # -- Source configs -------------------------------------------------------
+    fpl_cfg = FPLSourceConfig(
         provider=DataSource.FCI,
-        col_map=fci_map,
+        col_map=features.source_map(DataSource.FCI),
         player_id={"id": "player_id"},
-        id_map=id_map,
+        id_map=fci_id_map,
         stacked=False,
         denotes_epl={},
         other_games=False,
         gw_col=None,
-        gw_path=None,
-        gw_filename="playerstats.csv",
+        gw_path="",
+        gw_filename="player_gameweek_stats.csv",
         transform=None,
     )
 
     opta_cfg = FPLSourceConfig(
         provider=DataSource.OPTA,
-        col_map=opta_map,
+        col_map=features.source_map(DataSource.OPTA),
         player_id={"player_id": "player_id"},
-        id_map=id_map,
+        id_map=opta_id_map,
         stacked=False,
         denotes_epl={"match_id": "prem"},
         other_games=True,
         gw_col=None,
-        gw_path=None,
+        gw_path="",
         gw_filename="playermatchstats.csv",
         transform=None,
     )
@@ -195,74 +250,152 @@ def _build_season_25(features, id_map, team_codes):
     fixture_cfg = FixtureSourceConfig(
         provider=DataSource.FIXTURE,
         col_map={},
-        team_codes=team_codes,
+        team_codes=team_codes_df,
         stacked=False,
-        denotes_epl={"tournament": "Premier League"},
+        denotes_epl={"match_id": "prem"},
         other_games=True,
         gw_col=None,
         gw_path="",
+        gw_filename="fixtures.csv",
     )
 
-    return fci_cfg, opta_cfg, fixture_cfg
+    return season_root, player_meta, teams, fpl_cfg, opta_cfg, fixture_cfg
 
 
-def main():
-    """Run the end-to-end pipeline smoke test."""
-    # ── 2024-2025 season ────────────────────────────────────────────────────
-    players_24 = pd.read_csv(DATA_ROOT_24 / "players" / "players.csv")
-    players_24["position"] = players_24["position"].map(_POSITION_SHORT)
-    teams_24 = pd.read_csv(DATA_ROOT_24 / "teams" / "teams.csv")
+# =============================================================================
+# Season runner
+# =============================================================================
 
-    team_codes_24 = teams_24["code"].tolist()
-    features = build_features(team_codes_24)
-    logger.info(
-        "Features built: %d temporal, %d categorical",
-        len(features.temporal_columns),
-        len(features.categorical_columns),
-    )
 
-    id_map_24 = players_24[["player_id", "player_code", "team_code"]].copy()
-    team_codes_df_24 = teams_24[["code"]].rename(columns={"code": "team_code"})
-    player_meta_24 = (
-        _build_player_meta(players_24, features)
-        .assign(player_team_id=player_team_index)               # adds column "{player_code}_{team_code}"
-        .set_index("player_team_id")                            # indexes by new composite index column
-    )
-    
-    fpl_cfg_24, opta_cfg_24, fixture_cfg_24 = _build_season_24(
-        features, id_map_24, team_codes_df_24,
-    )
+def _run_season(
+    label: str,
+    season_root: str,
+    features: Features,
+    player_meta: pd.DataFrame,
+    teams: pd.DataFrame,
+    fpl_cfg: FPLSourceConfig,
+    opta_cfg: FPLSourceConfig,
+    fixture_cfg: FixtureSourceConfig,
+    gw_start: int,
+    gw_end: int,
+) -> None:
+    """
+    Build a SeasonSequencer, ingest a GW range, and build one player window.
 
-    seq_24 = SeasonSequencer(
+    Args:
+        label: Human-readable season label for logging (e.g. "24-25").
+        season_root: Path to the season data directory.
+        features: Feature registry for this season.
+        player_meta: Raw player metadata with position mapped to short codes.
+        teams: Teams DataFrame with code, name, elo, etc.
+        fpl_cfg: FPL API source config.
+        opta_cfg: OPTA source config.
+        fixture_cfg: Fixture source config.
+        gw_start: First gameweek to ingest (inclusive).
+        gw_end: Last gameweek to ingest (inclusive).
+    """
+    meta = _build_player_meta(player_meta, features)
+
+    seq = SeasonSequencer(
         features=features,
-        season_root=SEASON_ROOT_24,
-        fpl_config_season=fpl_cfg_24,
-        opta_config=opta_cfg_24,
-        fixture_config=fixture_cfg_24,
-        player_meta=player_meta_24,
-        teams_df=teams_24,
+        season_root=season_root,
+        fpl_config_season=fpl_cfg,
+        opta_config=opta_cfg,
+        fixture_config=fixture_cfg,
+        player_meta=meta,
+        teams_df=teams,
         window_size=8,
     )
 
-    logger.info("Ingesting 24-25 GW1-5...")
-    seq_24.ingest_player_range(1, 5)
-    logger.info("Ingestion complete. %d players tracked.", len(seq_24._first_gw))
+    logger.info("Ingesting %s GW%d-%d...", label, gw_start, gw_end)
+    seq.ingest_player_range(gw_start, gw_end)
+    logger.info("Ingestion complete. %d players tracked.", len(seq._first_gw))
 
-    # Pick a player who appeared in GW1
-    gw1_players = [pid for pid, gw in seq_24._first_gw.items() if gw == 1]
+    # Pick a player who appeared in the first gameweek.
+    gw1_players = [pid for pid, gw in seq._first_gw.items() if gw == gw_start]
     if not gw1_players:
-        logger.error("No players found in GW1.")
+        logger.error("No players found in GW%d (%s).", gw_start, label)
         return
 
     test_player = gw1_players[0]
     logger.info("Building window for player: %s", test_player)
 
-    temporal, categorical = seq_24.build_player_window(test_player, 5)
+    temporal, categorical = seq.build_player_window(test_player, gw_end)
 
     logger.info("Temporal tensor shape:     %s", temporal.shape)
     logger.info("Categorical tensor shape:  %s", categorical.shape)
     logger.info("Temporal sample (row 0):   %s", temporal[0])
-    logger.info("Smoke test passed.")
+    logger.info("%s smoke test passed.", label)
+
+
+# =============================================================================
+# Private helpers
+# =============================================================================
+
+
+def _resolve_teams_path(data_root: pathlib.Path) -> pathlib.Path:
+    """Locate teams.csv by checking known season folder layouts."""
+    candidates = [
+        data_root / "teams.csv",
+        data_root / "Fixtures" / "teams.csv",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+
+    raise FileNotFoundError(
+        f"teams.csv not found in {data_root}. "
+        f"Checked: {[str(c) for c in candidates]}"
+    )
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+def main():
+    """Run the end-to-end pipeline smoke test for each season."""
+    seasons = [
+        ("24-25", DATA_ROOT_24, _setup_season_24),
+        ("25-26", DATA_ROOT_25, _setup_season_25),
+    ]
+
+    for label, data_root, setup_fn in seasons:
+        # Load teams first to build Features (needs team codes for embeddings).
+        teams_path = _resolve_teams_path(data_root)
+        teams = pd.read_csv(teams_path)
+        team_codes = teams["code"].tolist()
+        features = build_features(team_codes)
+
+        logger.info(
+            "%s — Features built: %d temporal, %d categorical",
+            label,
+            len(features.temporal_columns),
+            len(features.categorical_columns),
+        )
+
+        season_root, player_meta, teams_df, fpl_cfg, opta_cfg, fixture_cfg = (
+            setup_fn(features)
+        )
+
+        _run_season(
+            label, season_root, features, player_meta, teams_df,
+            fpl_cfg, opta_cfg, fixture_cfg,
+            gw_start=1, gw_end=1,
+        )
+
+    # -- Feature sanity check -------------------------------------------------
+    logger.info("--- Feature Sanity Check (last season) ---")
+    logger.info("Temporal features (%d columns):", len(features.temporal_columns))
+    for i, name in enumerate(features.temporal_columns):
+        logger.info("  [%d] %s", i, name)
+
+    logger.info(
+        "Categorical features (%d columns):", len(features.categorical_columns),
+    )
+    for i, name in enumerate(features.categorical_columns):
+        logger.info("  [%d] %s", i, name)
 
 
 if __name__ == "__main__":

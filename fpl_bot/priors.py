@@ -20,13 +20,13 @@ class PriorData:
     """
     Container for the four-level prior hierarchy.
 
-    Serialisable to and from JSON.
+    Serialisable to and from JSON, so all keys are strings.
     """
-    league: dict[str, dict[str, float]]         #
-    position: dict[str, dict[str, float]]       #
-    position_team: dict[str, dict[str, float]]  #
-    individual: dict[str, dict[str, float]]     # keys are str because JSON requires string keys
-    meta_data: dict                             #
+    league: dict[str, dict[str, float]]         # league-wide averages (broadest fallback)
+    position: dict[str, dict[str, float]]       # per-position averages
+    position_team: dict[str, dict[str, float]]  # per-position-team averages
+    individual: dict[str, dict[str, float]]     # per-player averages 
+    meta_data: dict                             # computation metadata (latest_gw, thresholds)
 
     #================================================
     # Public Functions
