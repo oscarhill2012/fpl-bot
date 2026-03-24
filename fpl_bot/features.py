@@ -471,10 +471,10 @@ class Features:
         Maps source columns to output columns.
 
         Args:
-            Provider: dictates which provider source cols from
+            provider: Dictates which provider to source columns from.
 
-        Return:
-            Dict: keys are source names, values are output names
+        Returns:
+            Dict: keys are source names, values are output names.
         """
         return {
             s.source[provider]: s.name
@@ -582,7 +582,7 @@ class Features:
 
         Args:
             df: DataFrame to validate.
-            expected_cols: input list of feature names
+            feature_list: Input list of feature names.
             context: Optional label for error messages, e.g. "GW1".
         """
         # convert to source names 

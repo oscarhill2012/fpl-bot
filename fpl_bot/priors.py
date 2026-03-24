@@ -130,7 +130,6 @@ class PriorComputer:
         self.providers = [DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV, DataSource.INGESTER, DataSource.PRIOR]
 
         self.output_columns = features.output_columns_for(self.providers)
-        self.cumulative_cols = features.cumulative_columns_for(self.providers)
         self.per_90_cols = features.per_90_columns_for(self.providers)
         self.snapshot_cols = features.snapshot_columns_for(self.providers)
         self.cum_rev_map = features.inv_cumulative_map_for(self.providers)

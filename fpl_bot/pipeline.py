@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import Tuple
 
 import torch
 
@@ -395,7 +394,7 @@ class _BoundedScaler(_LinearScaler):
     #================================================
 
     @property
-    def params(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def params(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Min and max scaling parameters (min_value, max_value); redundant but present for interface consistency."""
         # redundant, as cannot call params without user inputs min and max,
         # but required for interface consistency when storing params for all scalers
@@ -631,7 +630,7 @@ class FeatureScaler:
         Raises:
             RuntimeError: If called before train_scale().
         """
-        # training data must be scaled with params from test, or we leak distribution information to model
+        # test data must be scaled with params from training, or we leak distribution information to model
         if not self._fitted:
             raise RuntimeError('Fit training data before scaling Test')
 

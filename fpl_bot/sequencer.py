@@ -69,6 +69,7 @@ class SeasonSequencer:
 
         self.providers = [DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV, DataSource.INGESTER, DataSource.PRIOR, DataSource.SEQUENCER]
         self._output_columns = features.output_columns_for(self.providers)
+        self._derived_columns = features.output_columns_for([DataSource.SEQUENCER])
         
         # index by player code for fast lookup
         if player_meta.index.name != "player_team_id":
@@ -319,7 +320,7 @@ class SeasonSequencer:
             prior_row = None
 
         return prior_row
-        
+
     def _get_prior(self, player_team_id: str, team_code: str, position: str) -> dict[str, float]:
         """Look up the best available prior for a player, falling back through the hierarchy."""
         if self._prior_data is None:
@@ -361,7 +362,7 @@ class SeasonSequencer:
         return real_row
 
     def _build_input_window(self, player_team_id: str, team_code: int, position_idx: int, prior_row: list[float], gw_window: list[int]) -> list[float]:
-        """Builds window of input (to model) features"""
+        """Assemble one row per timestep from real data or priors for model input."""
         output_columns = self.features.output_columns
         unified_rows = []
 
@@ -382,7 +383,7 @@ class SeasonSequencer:
         return unified_rows
 
     def _build_future_fixtures_window(self, team_code: int, target_gw: int) -> list[int]:
-        """Builds a window of a teams future fixtures."""
+        """Build a window of a team's future fixtures."""
         target_window = list(range(target_gw,(target_gw + self._target_window_size)))
 
         future_fixture = []
@@ -393,7 +394,7 @@ class SeasonSequencer:
         return future_fixture
 
     def _build_target_window(self, player_team_id: str, target_gw: int, target_feature: str, inference: bool) -> list[float]:
-        """Builds window of target feature"""
+        """Collect target feature values across the prediction window."""
         target_window = list(range(target_gw,(target_gw + self._target_window_size)))
 
         target_data = []

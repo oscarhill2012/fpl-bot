@@ -81,7 +81,7 @@ class FixtureProvider:
         self.season_root = season_root
         self.providers = [self.cfg.provider, DataSource.FIXINGESTER]
 
-        # output_cols: features (ordered by Feature convention) outputed from provider instance
+        # output_cols: features (ordered by Feature convention) output from provider instance
         self.output_cols = features.output_columns_for(self.providers)
 
         # provider_cols: features this provider loads from CSV (used for numeric coercion)
@@ -240,7 +240,7 @@ class GameweekProvider:
         self.snapshot_cols = features.snapshot_columns_for(self.providers)
         self.cumulative_cols = list(features.cumulative_columns_for(self.providers))
 
-        # output_cols: features (ordered by Feature convention) outputed from provider instance
+        # output_cols: features (ordered by Feature convention) output from provider instance
         self.output_cols = features.output_columns_for(self.providers)
 
         # provider_cols: features this provider loads from CSV (used for numeric coercion)
@@ -345,9 +345,9 @@ class GameweekProvider:
     
     def _per_90_guard(self, gw_data: pd.DataFrame) -> pd.DataFrame:
         """Remove any existing per_90 columns so no duplicates arise when we rename."""
-        for cols in gw_data.columns:
-            if "per_90" in cols:
-                gw_data = gw_data.drop(cols, axis=1)
+        for col in gw_data.columns:
+            if "per_90" in col:
+                gw_data = gw_data.drop(col, axis=1)
 
         return gw_data
 
@@ -435,7 +435,7 @@ class GameweekProvider:
     #================================================
 
     def _defcon_derivation(self, gw_data: pd.DataFrame, feature: str) -> pd.DataFrame:
-        """Derives defcon feature"""
+        """Sum tackles, recoveries, blocks, and clearances into the defcon feature."""
         gw_data[feature] = gw_data[["tackles", "recoveries", "blocks", "clearances"]].sum(axis=1)
 
         return gw_data
