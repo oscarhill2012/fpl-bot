@@ -127,11 +127,13 @@ class PriorComputer:
         self._validate_input()
 
         self.features = features
-        self.output_columns = features.pre_seq_columns_for([DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV])
-        self.cumulative_cols = features.cumulative_columns_for([DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV])
-        self.per_90_cols = features.per_90_columns_for([DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV])
-        self.snapshot_cols = features.snapshot_columns_for([DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV])
-        self.cum_rev_map = features.inv_cumulative_map
+        self.providers = [DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV, DataSource.INGESTER, DataSource.PRIOR]
+
+        self.output_columns = features.output_columns_for(self.providers)
+        self.cumulative_cols = features.cumulative_columns_for(self.providers)
+        self.per_90_cols = features.per_90_columns_for(self.providers)
+        self.snapshot_cols = features.snapshot_columns_for(self.providers)
+        self.cum_rev_map = features.inv_cumulative_map_for(self.providers)
 
         if player_meta.index.name != "player_team_id":
             player_meta["player_team_id"] = player_team_index(player_meta)

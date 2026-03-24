@@ -136,7 +136,6 @@ def _setup_season_24(
     # -- Source configs -------------------------------------------------------
     fpl_cfg = FPLSourceConfig(
         provider=DataSource.VAASTAV,
-        col_map=features.source_map(DataSource.VAASTAV),
         player_id={"element": "player_id"},
         id_map=vaastav_id_map,
         stacked=True,
@@ -150,7 +149,6 @@ def _setup_season_24(
 
     opta_cfg = FPLSourceConfig(
         provider=DataSource.OPTA,
-        col_map=features.source_map(DataSource.OPTA),
         player_id={"player_id": "player_id"},
         id_map=opta_id_map,
         stacked=False,
@@ -164,7 +162,6 @@ def _setup_season_24(
 
     fixture_cfg = FixtureSourceConfig(
         provider=DataSource.FIXTURE,
-        col_map={},
         team_codes=team_codes_df,
         stacked=False,
         denotes_epl={"match_id": "prem"},
@@ -221,7 +218,6 @@ def _setup_season_25(
     # -- Source configs -------------------------------------------------------
     fpl_cfg = FPLSourceConfig(
         provider=DataSource.FCI,
-        col_map=features.source_map(DataSource.FCI),
         player_id={"id": "player_id"},
         id_map=fci_id_map,
         stacked=False,
@@ -235,7 +231,6 @@ def _setup_season_25(
 
     opta_cfg = FPLSourceConfig(
         provider=DataSource.OPTA,
-        col_map=features.source_map(DataSource.OPTA),
         player_id={"player_id": "player_id"},
         id_map=opta_id_map,
         stacked=False,
@@ -249,7 +244,6 @@ def _setup_season_25(
 
     fixture_cfg = FixtureSourceConfig(
         provider=DataSource.FIXTURE,
-        col_map={},
         team_codes=team_codes_df,
         stacked=False,
         denotes_epl={"match_id": "prem"},

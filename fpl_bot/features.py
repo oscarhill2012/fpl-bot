@@ -39,13 +39,24 @@ class AccumulationType(Enum):
     RAW_CUMULATIVE = "raw"  # accumulated but NOT divided by minutes
 
 class DataSource(Enum):
+    # external — loaded from CSV files
     VAASTAV = "vaastav"
     FCI = "fci"
     OPTA = "opta"
     FIXTURE = "fixture"
-    SEQUENCER = "seq"
+    # derived — computed internally by pipeline stages
+    INGESTER = "ingester"
+    FIXINGESTER = "fixture_ingester"
+    PRIOR = "prior"
+    SEQUENCER = "sequencer"
+    SCALER = "scaler"
 
-EXTERNAL_DATA_SOURCES = frozenset({DataSource.VAASTAV, DataSource.FCI, DataSource.OPTA, DataSource.FIXTURE})
+EXTERNAL_DATA_SOURCES = frozenset({
+    DataSource.VAASTAV,
+    DataSource.FCI,
+    DataSource.OPTA,
+    DataSource.FIXTURE,
+})
 
 
 class FeatureSpec:
@@ -62,7 +73,7 @@ class FeatureSpec:
         scaling_mode: ScalingMode,
         accumulation: AccumulationType,
         temporal: bool,
-        source_columns: dict[DataSource, str],
+        source: dict[DataSource, str] | None = None,
         presence_check: bool = False,
         categories: list | None = None,
         embedding_dim: int | None = None,
@@ -80,10 +91,11 @@ class FeatureSpec:
             scaling_mode: How the feature will be scaled before model input.
             accumulation: How the ingester accumulates this feature across gameweeks.
             temporal: Whether the feature varies over time.
-            source_columns: Mapping of provider to raw column name,
-                e.g. {DataSource.VAASTAV: "goals_scored"}. Every feature must
-                have at least one entry. SEQUENCER features use
-                {DataSource.SEQUENCER: "<feature_name>"}.
+            source: Mapping of DataSource to raw/output column name. External
+                sources (VAASTAV, FCI, OPTA, FIXTURE) map to a raw CSV column;
+                derived sources (INGESTER, SEQUENCER, PRIOR, SCALER) map to
+                the output column produced by that pipeline stage. Every
+                feature must have at least one entry.
             presence_check: If True, a feature value equal to min_value indicates
                 missing data rather than a genuine zero.
             categories: Category list for categorical features.
@@ -98,7 +110,6 @@ class FeatureSpec:
         self.scaling_mode = scaling_mode
         self.temporal = temporal
         self.accumulation = accumulation
-
         self.presence_check = presence_check
         self.categories = categories
         self.embedding_dim = embedding_dim
@@ -106,8 +117,9 @@ class FeatureSpec:
         self.min_value = min_value
         self.period = period
 
-        self.source_columns = source_columns
-        # fitted scaling parameters [p1, p2]
+        self.source = source if source is not None else {}
+
+        # avoid mutable defaults
         self.scaling_params = scaling_params if scaling_params is not None else [None, None]
 
         self._validate()
@@ -118,15 +130,15 @@ class FeatureSpec:
  
     def _validate(self):
         """Validate feature spec fields, raising ValueError on misconfiguration."""
-        # every feature must have at least one source column
-        if not self.source_columns:
+        # every feature must have at least one source mapping
+        if not self.source:
             raise ValueError(
-                f"{self.name}: source_columns must be non-empty — "
+                f"{self.name}: source must be non-empty — "
                 f"every feature needs at least one provider mapping."
             )
 
         # sequencer features must not be accumulated
-        if DataSource.SEQUENCER in self.source_columns:
+        if DataSource.SEQUENCER in self.source:
             if self.accumulation != AccumulationType.NONE:
                 raise ValueError(
                     f"{self.name}: SEQUENCER feature must have accumulation=NONE — "
@@ -195,13 +207,18 @@ class FeatureSpec:
 
     @property
     def providers(self) -> set[DataSource]:
-        """Set of data sources that can supply this feature."""
-        return set(self.source_columns.keys())
+        """Set of all data sources (external and derived) for this feature."""
+        return set(self.source.keys())
 
     @property
     def is_sequencer(self) -> bool:
         """True if this feature is stamped by the sequencer, not loaded from CSV."""
-        return DataSource.SEQUENCER in self.source_columns
+        return DataSource.SEQUENCER in self.source
+
+    @property
+    def is_derived(self) -> bool:
+        """True if this feature is computed internally rather than loaded from CSV."""
+        return not self.providers.issubset(EXTERNAL_DATA_SOURCES)
 
 
 class Features:
@@ -289,11 +306,6 @@ class Features:
         ]
 
     @cached_property
-    def fixture_columns(self) -> list[str]:
-        """Feature names that come from fixture information"""
-        return [s.name for s in self.specs if DataSource.FIXTURE in s.source_columns]
-
-    @cached_property
     def temporal_columns(self) -> list[str]:
         """Feature names for continuous (non-categorical) features; defines the scaled tensor columns."""
         return [s.name for s in self.specs if s.feature_type != FeatureType.CATEGORICAL]
@@ -338,27 +350,24 @@ class Features:
     # Column lists narrowed to features supplied by a specific DataSource.
     #================================================
 
-    def _columns_for(self, base_list: list[str], providers: list[DataSource]) -> list[str]:
+    def _columns_for(self, base_list: list[str], providers: DataSource | list[DataSource]) -> list[str]:
         """
         Helper: Filter any column list to only those supplied by given providers.
 
         Args:
             base_list: List of output column names to filter.
-            providers: DataSources to filter by.
+            providers: Single DataSource or list of DataSources to filter by.
 
         Returns:
             Subset of base_list where any provider has a non-None source column.
         """
+        providers = self._normalise_providers(providers)
         return [
             name for name in base_list
-            if any(
-                provider in self._spec_by_name[name].source_columns
-                and self._spec_by_name[name].source_columns[provider] is not None
-                for provider in providers
-            )
-        ] 
+            if self._has_provider(self._spec_by_name[name], providers)
+        ]
 
-    def pre_seq_columns_for(self, providers: list[DataSource]) -> list[str]:
+    def output_columns_for(self, providers: list[DataSource]) -> list[str]:
         """
         Pre-Sequencer column names supplied by a given provider.
 
@@ -441,51 +450,57 @@ class Features:
             for out, cum in self.cumulative_map.items()
         }
 
-    def cumulative_map_for(self, provider: DataSource) -> dict[str, str]:
-        """
-        Maps output column name to cumulative column name for a given provider.
-
-        Args:
-            provider: DataSource to filter by.
-        """
+    def cumulative_map_for(self, providers: DataSource | list[DataSource]) -> dict[str, str]:
+        """Dict mapping output column name to cumulative column name for all accumulated features from given providers."""
+        cols = self.output_columns_for(providers)
         return {
-            s: self._spec_by_name[s].cum_col
-            for s in self.cumulative_map
-            if provider in self._spec_by_name[s].source_columns
-            and self._spec_by_name[s].source_columns[provider] is not None
+            col: self._spec_by_name[col].cum_col
+            for col in cols
+            if self._spec_by_name[col].cum_col is not None
         }
 
-    def inv_cumulative_map_for(self, provider: DataSource) -> dict[str, str]:
-        """
-        Maps cumulative column name to output column name for a given provider.
-
-        Args:
-            provider: DataSource to filter by.
-        """
+    def inv_cumulative_map_for(self, providers: DataSource | list[DataSource]) -> dict[str, str]:
+        """Dict mapping cumulative column name to output column name (inverse of cumulative_map) from given providers."""
         return {
-            self._spec_by_name[s].cum_col: s
-            for s in self.cumulative_map
-            if provider in self._spec_by_name[s].source_columns
-            and self._spec_by_name[s].source_columns[provider] is not None
+            cum: out
+            for out, cum in self.cumulative_map_for(providers).items()
         }
 
     def source_map(self, provider: DataSource) -> dict[str, str]:
         """
-        Maps raw source column name to output column name for one data provider.
+        Maps source columns to output columns.
 
         Args:
-            provider: DataSource key into FeatureSpec.source_columns,
-                e.g. DataSource.VAASTAV, DataSource.FCI, DataSource.OPTA.
+            Provider: dictates which provider source cols from
+
+        Return:
+            Dict: keys are source names, values are output names
+        """
+        return {
+            s.source[provider]: s.name
+            for s in self.specs
+            if provider in s.source
+        }
+
+    def get_source_names(self, base_list: list[str], providers: DataSource | list[DataSource]) -> list[str]:
+        """
+        Given a list of features names, and provider(s). Maps to source column names.
+
+        Args:
+            providers: Single DataSource or list of DataSources to filter by.
 
         Returns:
-            Dict of {source_col: output_col} for all specs with this provider.
+            List of features source name.
         """
-        result = {}
-        for s in self.specs:
-            if s.source_columns and provider in s.source_columns:
-                source_col = s.source_columns[provider]
-                if source_col is not None:
-                    result[source_col] = s.name
+        providers = self._normalise_providers(providers)
+        result = []
+        for name in base_list:
+            spec = self._spec_by_name[name]
+            
+            for provider in providers:
+                if provider in spec.source:
+                    result.append(spec.source[provider])
+    
         return result
 
     #================================================
@@ -544,7 +559,7 @@ class Features:
         """Group specs by provider; a multi-provider feature appears under each."""
         result: dict[DataSource, list[FeatureSpec]] = {}
         for s in self.specs:
-            for provider in s.source_columns:
+            for provider in s.source:
                 result.setdefault(provider, []).append(s)
         return result
 
@@ -553,18 +568,25 @@ class Features:
     # Runtime checks on DataFrames against the feature spec.
     #================================================
 
-    def validate_dataframe_from(self, df: pd.DataFrame, expected_cols: list[str], context: str = "") -> None:
+    def validate_dataframe_from_source(
+        self, 
+        df: pd.DataFrame, 
+        feature_list: list[str], 
+        providers: DataSource | list[DataSource] , 
+        context: str = ""
+    ) -> None:
         """
-        Check that a DataFrame from a provider contains the expected columns.
+        Takes list of Feature names, and checks if source names are in df (i.e apply before renaming).
 
         Raises ValueError if columns are missing; logs a warning for extra columns.
 
         Args:
             df: DataFrame to validate.
-            expected_cols: input list to check df against
+            expected_cols: input list of feature names
             context: Optional label for error messages, e.g. "GW1".
         """
-        
+        # convert to source names 
+        expected_cols = self.get_source_names(feature_list, providers)
         expected = set(expected_cols)
         actual = set(df.columns)
         missing = expected - actual
@@ -591,7 +613,7 @@ class Features:
                 "accumulation": s.accumulation.value,
                 "scaling_params": s.scaling_params,
                 "temporal": s.temporal,
-                "source_columns": {k.value: v for k, v in s.source_columns.items()} if s.source_columns else {},
+                "source": {k.value: v for k, v in s.source.items()} if s.source else {},
                 "presence_check": s.presence_check,
                 "categories": s.categories,
                 "embedding_dim": s.embedding_dim,
@@ -615,15 +637,24 @@ class Features:
         """
         specs = []
         for d in data:
-            # backwards compat: old JSON may have feature_provider but no source_columns
-            source_columns = {
-                DataSource(k): v
-                for k, v in d.get("source_columns", {}).items()
-            }
-            if not source_columns and "feature_provider" in d:
-                provider = DataSource(d["feature_provider"])
-                if provider == DataSource.SEQUENCER:
-                    source_columns = {DataSource.SEQUENCER: d["name"]}
+            # backwards compat: accept old "source_columns" key as well as "source"
+            raw_source = d.get("source", d.get("source_columns", {}))
+
+            # backwards compat: old "seq" value maps to new SEQUENCER
+            source = {}
+            for k, v in raw_source.items():
+                ds_value = "sequencer" if k == "seq" else k
+                source[DataSource(ds_value)] = v
+
+            # backwards compat: merge any old "derived" entries into source
+            for k, v in d.get("derived", {}).items():
+                source.setdefault(DataSource(k), v)
+
+            # backwards compat: old JSON may have feature_provider instead
+            if not source and "feature_provider" in d:
+                provider_str = d["feature_provider"]
+                ds_value = "sequencer" if provider_str == "seq" else provider_str
+                source[DataSource(ds_value)] = d["name"]
 
             specs.append(
                 FeatureSpec(
@@ -633,7 +664,7 @@ class Features:
                     accumulation=AccumulationType(d.get("accumulation", "none")),
                     scaling_params=d["scaling_params"],
                     temporal=d["temporal"],
-                    source_columns=source_columns,
+                    source=source,
                     presence_check=d["presence_check"],
                     categories=d["categories"],
                     embedding_dim=d["embedding_dim"],
@@ -673,6 +704,25 @@ class Features:
                 dtype=torch.bool
             )
         return masks
+
+    #================================================
+    # Private Helpers
+    #================================================
+
+    @staticmethod
+    def _normalise_providers(providers: DataSource | list[DataSource]) -> list[DataSource]:
+        """Wrap a single DataSource in a list for uniform iteration."""
+        if isinstance(providers, DataSource):
+            return [providers]
+        return providers
+
+    @staticmethod
+    def _has_provider(spec: FeatureSpec, providers: list[DataSource]) -> bool:
+        """True if spec has a non-None source entry for any of the given providers."""
+        return any(
+            p in spec.source and spec.source[p] is not None
+            for p in providers
+        )
 
     #================================================
     # Dunder Overrides

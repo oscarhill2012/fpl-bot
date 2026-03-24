@@ -34,12 +34,8 @@ def _match_filter(
 class FPLSourceConfig:
     """
     Encodes the distinct nature of a data source so all sources can be treated uniformly.
-
-    All output columns required must be present in col_map (excluding defaults),
-    and any defaults will be added to col_map automatically.
     """
     provider: DataSource                                # data providers tag, "vaastav", "fci", "opta", "fixture"
-    col_map: dict[str, str]                             # source_col → output columns (should contain all columns even if no change)
     player_id: dict[str, str]                           # maps player_id column name in dataset to "player_id"
     id_map: pd.DataFrame                                # dataframe that contains local identity to global identity map
     stacked: bool                                       # one big file vs per-GW files
@@ -54,12 +50,8 @@ class FPLSourceConfig:
 class FixtureSourceConfig:
     """
     Encodes the distinct nature of a fixture source so all sources can be treated uniformly.
-
-    All output columns required must be present in col_map (excluding defaults),
-    and any defaults will be added to col_map automatically.
     """
     provider: DataSource                                # data providers tag, "vaastav", "fci", "opta", "fixture"
-    col_map: dict[str, str]                             # source_col → output columns (should contain all columns even if no change)
     team_codes: pd.DataFrame
     stacked: bool                                       # one big file vs per-GW files
     denotes_epl: dict[str, str]                         # verifies data from epl match: {identifying feature: identifying string}
@@ -87,7 +79,16 @@ class FixtureProvider:
         self.features = features
         self.cfg = config
         self.season_root = season_root
-        self.fixture_columns = features.fixture_columns
+        self.providers = [self.cfg.provider, DataSource.FIXINGESTER]
+
+        # output_cols: features (ordered by Feature convention) outputed from provider instance
+        self.output_cols = features.output_columns_for(self.providers)
+
+        # provider_cols: features this provider loads from CSV (used for numeric coercion)
+        self._provider_cols = list(features.output_columns_for(self.cfg.provider))
+
+        # derive_cols: any features to be derived in provider
+        self._derived_cols = list(features.output_columns_for([DataSource.FIXINGESTER]))
 
     #================================================
     # Public Functions
@@ -127,13 +128,16 @@ class FixtureProvider:
 
         gw_fixtures = (
             gw_fixtures
-            .set_index("team_code")                                 # indexes by new composite index column
-            .filter(items=self.fixture_columns)                     # select only output columns
-            .round()                                                # round any ELOs
-            .astype(int)                                            # set as ints       
+            .set_index("team_code", drop=False)     # indexes by team_code, but leaves as column for later use
+            .filter(items=self.output_cols)     # select only output columns
+            .round()                                # round any ELOs
+            .astype(int)                            # set as ints       
         )
 
-        gw_fixtures = gw_fixtures[self.fixture_columns]
+        self.features.validate_dataframe_from_source(
+            gw_fixtures, self.output_cols, [self.cfg.provider], context=f"GW{gw}"
+        )
+        gw_fixtures = gw_fixtures[self.output_cols]
 
         return gw_fixtures
 
@@ -194,6 +198,7 @@ class FixtureProvider:
             .fillna({"is_home": -1})                                  # -1 signals team didn't play this GW
         )
 
+
 class GameweekProvider:
     """
     Loads per-GW stats from Vaastav/FPL (FPL API) or FPL-Core-Insights (FPL API and Opta).
@@ -218,6 +223,7 @@ class GameweekProvider:
         """
         self.features = features
         self.cfg = config
+        self.providers = [self.cfg.provider, DataSource.INGESTER]
         self.season_root = season_root
         self.cumulative_gw_data = None
 
@@ -226,26 +232,31 @@ class GameweekProvider:
             self._stacked_data = pd.read_csv(self.season_root + self.cfg.gw_path)
 
         # generate column mapping dicts
-        self.cum_map = features.cumulative_map_for(config.provider)
-        self.cum_rev_map = features.inv_cumulative_map_for(config.provider)
+        self.cum_map = features.cumulative_map_for(self.providers)
+        self.cum_rev_map = features.inv_cumulative_map_for(self.providers)
 
         # generate snapshot, cumulative and output column names for provider
         # copy lists to avoid mutating the cached properties on the shared Features object
-        self.snapshot_cols = features.snapshot_columns_for([self.cfg.provider])
-        self.cumulative_cols = list(features.cumulative_columns_for([self.cfg.provider]))
+        self.snapshot_cols = features.snapshot_columns_for(self.providers)
+        self.cumulative_cols = list(features.cumulative_columns_for(self.providers))
+
+        # output_cols: features (ordered by Feature convention) outputed from provider instance
+        self.output_cols = features.output_columns_for(self.providers)
 
         # provider_cols: features this provider loads from CSV (used for numeric coercion)
-        self._provider_cols = list(features.pre_seq_columns_for([self.cfg.provider]))
-        
-        # output_cols: provider_cols + synthesised columns like "featured"
-        # NOTE: bit bodge, but featured is internal only feature, so doesnt really fit into FeatureSpecs
-        self.output_cols = self._provider_cols + ["featured"]
+        self._provider_cols = list(features.output_columns_for(self.cfg.provider))
+
+        # derive_cols: any features to be derived in provider
+        self._derived_cols = list(features.output_columns_for([DataSource.INGESTER]))
+
+        # NOTE: featured is a synthetic internal only feature, so manually add
+        self.output_cols.append("featured")
         self.cumulative_cols.append("featured")
         self.cum_map["featured"] = "cum_featured"
         self.cum_rev_map["cum_featured"] = "featured"
 
         # columns that will get per_90 rate (subtly different to cumulative_cols as these contain "minutes")
-        self.per_90_cols = features.per_90_columns_for([self.cfg.provider])
+        self.per_90_cols = features.per_90_columns_for(self.providers)
 
     #================================================
     # Public Functions
@@ -279,16 +290,15 @@ class GameweekProvider:
         gw_data = self._load_raw(gw)
 
         # validate dataframe
-        self.features.validate_dataframe_from(gw_data, list(self.cfg.col_map.keys()), f"GW{gw}")
+        self.features.validate_dataframe_from_source(gw_data, self._provider_cols, [self.cfg.provider],f"GW{gw}")
 
         gw_data = _match_filter(gw_data, self.cfg.other_games, self.cfg.denotes_epl, f"GW{gw}")
 
         gw_data = self._per_90_guard(gw_data)
 
         # filter output columns, rename to output column names
-        gw_data = gw_data.rename(columns=self.cfg.player_id | self.cfg.col_map)
+        gw_data = gw_data.rename(columns=self.cfg.player_id | self.cum_map)
        
-        
         # coerce all output columns to numeric (real data may have string-typed floats)
         # exclude "featured" — it is synthesised by _add_featured_col, not loaded from CSV
         gw_data = self._force_numeric_cols(gw_data, self._provider_cols)
@@ -296,6 +306,10 @@ class GameweekProvider:
         # featured = 1 if player has mins > 0, this will useful for averaging in priors
         gw_data = self._add_featured_col(gw_data)
 
+        # add derived columns, if any
+        if self._derived_cols:
+            gw_data = self._add_derived_columns(gw_data)
+        
         gw_data = self._aggregate_dgw(gw_data)
 
         # process gw_data
@@ -354,6 +368,15 @@ class GameweekProvider:
 
         return gw_data
 
+    def _add_derived_columns(self, gw_data: pd.DataFrame) -> pd.DataFrame:
+        """Checks which features need deriving, requests derivation."""
+        # please see: Feature Derivation Methods
+        for feature in self._derived_cols:
+            if feature == "defcon_per_90":
+                gw_data = self._defcon_derivation(gw_data, feature)
+
+        return gw_data
+
     def _aggregate_dgw(self, gw_data: pd.DataFrame) -> pd.DataFrame:
         """Aggregate (sums DGW appearances), ignoring any non-cumulative columns"""
         gw_data[self.cumulative_cols] = gw_data.groupby("player_id")[self.cumulative_cols].transform("sum")
@@ -407,7 +430,16 @@ class GameweekProvider:
         )
         return gw_data
 
+    #================================================
+    # Feature Derivation Methods
+    #================================================
 
+    def _defcon_derivation(self, gw_data: pd.DataFrame, feature: str) -> pd.DataFrame:
+        """Derives defcon feature"""
+        gw_data[feature] = gw_data[["tackles", "recoveries", "blocks", "clearances"]].sum(axis=1)
+
+        return gw_data
+    
 class Ingester:
     """
     Ingests data from a source depending on the provided config.
@@ -443,18 +475,20 @@ class Ingester:
         """
         self.features = features
         self.season_root = season_root
+        
+        self.providers = [fpl_config.provider, opta_config.provider, fixture_config.provider, DataSource.INGESTER, DataSource.FIXINGESTER]
+        self.output_cols = features.output_columns_for(self.providers)
 
         # initialise providers
         self.fpl_provider = GameweekProvider(features, fpl_config, season_root)
         self.opta_provider = GameweekProvider(features, opta_config, season_root)
         self.fixture_provider = FixtureProvider(features, fixture_config, season_root)
+
         # assign states for data storage
         self.player_gw_stats: dict[int, pd.DataFrame] = {}
         self.player_cumulative_stats: dict[int, pd.DataFrame] = {}
         self.first_gw: dict[str, int] = {}
         self.fixtures: dict[int, pd.DataFrame] = {}
-
-        self.cum_rev_map = features.inv_cumulative_map
 
     #================================================
     # Player Data Ingestion
@@ -582,11 +616,7 @@ class Ingester:
             self.opta_provider.cumulative_gw_data,
         )
         # ensure that gw_combined has columns ordered by convention
-        gw_combined = gw_combined[
-            self.features.pre_seq_columns_for(
-                [self.fpl_provider.cfg.provider, self.opta_provider.cfg.provider]
-            )
-        ]
+        gw_combined = gw_combined[self.output_cols]
 
         self._update_first_gw(gw_combined, gw)
         return gw_combined, gw_cum_combined

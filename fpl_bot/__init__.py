@@ -15,5 +15,5 @@ from .ingester import (
 )
 from .sequencer import SeasonSequencer
 from .priors import PriorData, PriorComputer
-from .feature_registry import build_features, _build_specs
+from .feature_registry import build_features24, _build_specs24, build_features25, _build_specs25
 from .player_team_index import player_team_index
