@@ -127,7 +127,14 @@ class PriorComputer:
         self._validate_input()
 
         self.features = features
-        self.providers = [DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV, DataSource.INGESTER, DataSource.PRIOR]
+        self.providers = [
+            DataSource.OPTA, 
+            DataSource.FCI, 
+            DataSource.VAASTAV, 
+            DataSource.OPTAINGESTER,
+            DataSource.FPLINGESTER, 
+            DataSource.PRIOR,
+        ]
 
         self.output_columns = features.output_columns_for(self.providers)
         self.per_90_cols = features.per_90_columns_for(self.providers)

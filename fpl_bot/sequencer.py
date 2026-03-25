@@ -40,7 +40,6 @@ class SeasonSequencer:
         opta_config: FPLSourceConfig,
         fixture_config: FixtureSourceConfig,
         player_meta: pd.DataFrame,
-        teams_df: pd.DataFrame,
         window_size: int=8,
         predict_window_size: int=1,
         prior_data: PriorData | None = None,
@@ -56,7 +55,6 @@ class SeasonSequencer:
             player_meta: DataFrame indexed by player_team_code with columns
                 including 'position' and 'team_code'.
             fixture_config: Source configuration for fixture data.
-            teams_df: DataFrame of team strength and Elo data.
             window_size: Number of past gameweeks to include in each sequence.
             prior_data: Pre-computed prior data; if None, computed from the
                 first ingest_range() call.
@@ -67,7 +65,16 @@ class SeasonSequencer:
         self._target_window_size = predict_window_size
         self.features = features
 
-        self.providers = [DataSource.OPTA, DataSource.FCI, DataSource.VAASTAV, DataSource.INGESTER, DataSource.PRIOR, DataSource.SEQUENCER]
+        self.providers = [
+            DataSource.OPTA, 
+            DataSource.FCI, 
+            DataSource.VAASTAV, 
+            DataSource.OPTAINGESTER, 
+            DataSource.FPLINGESTER,
+            DataSource.PRIOR, 
+            DataSource.SEQUENCER
+        ]
+
         self._output_columns = features.output_columns_for(self.providers)
         self._derived_columns = features.output_columns_for([DataSource.SEQUENCER])
         
@@ -81,15 +88,15 @@ class SeasonSequencer:
             self.player_meta = meta
 
         # save player_meta as a dict for quicker lookup
-        self._player_meta: dict[str, dict[str, int]] = meta.to_dict(orient="index")
+        self._player_meta: dict[str, dict[str, int]] = self.player_meta.to_dict(orient="index")
 
         # nothing ingested yet
         self._current_gameweek: int = 0
         self._prior_data = prior_data
 
-        # first gameweek a player plays minutes > 0, until then we use priors
+        # first gameweek a player plays minutes > 0, until then we use ingest_range
         self._first_gw: dict[str, str] = {}
-
+        
         # cache data in as dict, so lookup cheaper than pandas .loc
         self.player_cache: dict[int, dict[str, dict[str, float]]] = {}
 
@@ -102,12 +109,12 @@ class SeasonSequencer:
     #================================================
 
     def _build_prior_fixtures(self) -> dict[str, int]:
-        """Build blank fixture row for prior timesteps; oppo_team_code defaults to padding index 0."""
+        """Build blank fixture row for prior timesteps; team_code keeps its real value."""
         prior_fixture_row = {}
         for code in self.features._spec_by_name["team_code"].categories:
             prior_fixture_row[code] = {
                 feature: (code if feature == "team_code" else -1 if feature == "is_home" else 0)
-                for feature in self.features.output_columns_for([DataSource.FIXINGESTER, DataSource.INGESTER])
+                for feature in self.features.output_columns_for([DataSource.FIXTURE, DataSource.FIXINGESTER])
             }
         return prior_fixture_row
 
@@ -122,11 +129,43 @@ class SeasonSequencer:
         return self
 
     #================================================
+    # PyTorch Helpers
+    # Helps torch.utils.Dataset interface
+    #================================================
+
+    @property
+    def current_gw(self) -> int:
+        """The latest ingested gameweek number."""
+        return self._current_gameweek
+
+    def dataset(
+        self,
+        gw_start: int = 1,
+        gw_end: int | None = None,
+        player_codes: list[str] | None = None,
+    ) -> "FPLDataset":
+        """
+        Create a Dataset for the specified gameweek range.
+
+        Args:
+            gw_start: First target gameweek (inclusive).
+            gw_end: Last target gameweek (inclusive).
+                Defaults to current_gameweek - target_window_size.
+            player_codes: Optional player filter; if None, all players included.
+
+        Returns:
+            FPLDataset wrapping this sequencer.
+        """
+        if gw_end is None:
+            gw_end = self._current_gameweek - self._target_window_size
+        return FPLDataset(self, gw_start, gw_end, player_codes)
+
+    #================================================
     # Ingestion and State Management
     # Methods for loading gameweeks and advancing state.
     #================================================
 
-    def ingest_player_range(self, gw_start: int, gw_end: int) -> "SeasonSequencer":
+    def ingest_range(self, gw_start: int, gw_end: int) -> "SeasonSequencer":
         """
         Bulk-ingest player data for range of gameweeks.
 
@@ -163,6 +202,14 @@ class SeasonSequencer:
 
         return self
 
+    @property
+    def get_prior(self) -> "PriorData":
+        """Returns priors, if calculated."""
+        if not self._prior_data: 
+            raise RuntimeError("Please ingest to get priors.")
+
+        return self._prior_data
+        
     def step(self) -> "SeasonSequencer":
         """
         Advance the sequencer by one gameweek.
@@ -233,7 +280,7 @@ class SeasonSequencer:
         # static categorical codes, constant across timesteps
         position = self._player_meta[player_team_id]["position"]
         team_code = self._player_meta[player_team_id]["team_code"]
-        position_idx = self._player_meta[player_team_id]["position_idx"]
+        position_idx = self._player_meta[player_team_id]["position"]
         first_gw = self._first_gw[player_team_id]
 
         # gw_window is a list of gw numbers, for whoms data we fetch. padded with 0s for prior rows
@@ -267,8 +314,8 @@ class SeasonSequencer:
         full = np.array(input_data, dtype=np.float32)
 
         x_continuous = full[:, self.features.continuous_indices].astype(np.float32).round(3)
-        x_categorical = full[:, self.features.categorical_indices].astype(np.int32)
-        x_future_fixtures = np.array(future_fixtures, dtype=np.int32)
+        x_categorical = full[:, self.features.categorical_indices].astype(np.int64)
+        x_future_fixtures = np.array(future_fixtures, dtype=np.int64)
 
         y_predict = np.array(target_data, dtype=np.float32)
 
@@ -361,8 +408,15 @@ class SeasonSequencer:
         real_row["is_prior"], real_row["data_age"] = 0.0, 0.0
         return real_row
 
-    def _build_input_window(self, player_team_id: str, team_code: int, position_idx: int, prior_row: list[float], gw_window: list[int]) -> list[float]:
-        """Assemble one row per timestep from real data or priors for model input."""
+    def _build_input_window(
+        self, 
+        player_team_id: str, 
+        team_code: int, 
+        position_idx: int, 
+        prior_row: list[float], 
+        gw_window: list[int]
+    ) -> list[float]:
+        """Builds window of input (to model) features"""
         output_columns = self.features.output_columns
         unified_rows = []
 
@@ -383,7 +437,7 @@ class SeasonSequencer:
         return unified_rows
 
     def _build_future_fixtures_window(self, team_code: int, target_gw: int) -> list[int]:
-        """Build a window of a team's future fixtures."""
+        """Builds a window of a teams future fixtures."""
         target_window = list(range(target_gw,(target_gw + self._target_window_size)))
 
         future_fixture = []
@@ -394,7 +448,7 @@ class SeasonSequencer:
         return future_fixture
 
     def _build_target_window(self, player_team_id: str, target_gw: int, target_feature: str, inference: bool) -> list[float]:
-        """Collect target feature values across the prediction window."""
+        """Builds window of target feature"""
         target_window = list(range(target_gw,(target_gw + self._target_window_size)))
 
         target_data = []
@@ -414,15 +468,109 @@ class FPLDataset(Dataset):
         sequencer: SeasonSequencer, 
         gw_start: int, 
         gw_end: int, 
-        player_codes=None
+        player_team_id: list[str] | None = None,
+        inference: bool = False
     ):
         self.sequencer = sequencer
+        self._inference = inference 
+
+        # --- validate gameweek range ---
+        if gw_start < 1:
+            raise ValueError(f"gw_start must be >= 1, got {gw_start}.")
+        if gw_end < gw_start:
+            raise ValueError(
+                f"gw_end ({gw_end}) must be >= gw_start ({gw_start})."
+            )
+
+        target_end = gw_end + sequencer._target_window_size
+        if target_end > 38:
+            raise ValueError(
+                f"Target window extends to GW{target_end}, beyond GW38."
+            )
+        if not inference and target_end > sequencer.current_gw:
+            raise ValueError(
+                f"Target window extends to GW{target_end} but only "
+                f"GW1-{sequencer.current_gw} are ingested. "
+                "Set inference=True or ingest more gameweeks."
+            )
+
+        # --- determine player set ---
+
+        if player_team_id is not None:
+            known = set(sequencer._player_meta.keys())
+            unknown = set(player_team_id) - known
+            if unknown:
+                raise ValueError(
+                    f"Unknown player codes: {unknown}"
+                )
+            players = list(player_team_id)
+        else:
+            players = list(sequencer._player_meta.keys())
+
+        # --- build flat sample index ---
+        # Order: all players for GW1, then all for GW2, etc.
+        self._sample_index: list[tuple[str, int]] = [
+            (player_id, gw)
+            for gw in range(gw_start, gw_end + 1)
+            for player_id in players
+        ]
+
+        logger.info(
+            "FPLDataset created: %d players x GW%d-%d = %d samples",
+            len(players), gw_start, gw_end, len(self._sample_index),
+        )
+
+    #====================================================================
+    # Dataset Rewrites
+    # allows torch to handle interface between sequencer and model
+    #====================================================================
 
     def __len__(self): 
-        return len(self.sample_index)
+        """Return the total number of (player, gameweek) samples."""
+        return len(self._sample_index)
 
     def __getitem__(self, idx: int):
-        
+        """
+        Retrieve a single training sample as a dictionary of tensors.
+
+        Args:
+            idx: Integer index into the sample index.
+
+        Returns:
+            Dictionary with keys:
+                x_continuous: float32 tensor, shape [T, F_cont].
+                x_categorical: long tensor, shape [T, C].
+                x_future_fixtures: long tensor, shape [K, fix_features].
+                y: float32 tensor, shape [target_window_size].
+        """
         player_team_code, target_gw = self.sample_index[idx]
 
-        self.sequencer.build_player_window(player_team_code, target_gw)
+        sample = self.sequencer.build_player_window(
+            player_team_code, 
+            target_gw,
+            inference=self._inference,
+            )
+        
+        return {
+            "x_continuous": torch.tensor(
+                sample["x_continuous"], dtype=torch.float32,
+            ),
+            "x_categorical": torch.tensor(
+                sample["x_categorical"], dtype=torch.long,
+            ),
+            "x_future_fixtures": torch.tensor(
+                sample["x_future_fixtures"], dtype=torch.long,
+            ),
+            "y": torch.tensor(
+                sample["y"], dtype=torch.float32,
+            ),
+        }
+
+    #================================================
+    # Inspection Helpers
+    #================================================
+
+    @property
+    def sample_index(self) -> list[tuple[str, int]]:
+        """Copy of the (player_team_id, target_gw) index for inspection."""
+        return list(self._sample_index)

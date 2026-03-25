@@ -15,6 +15,8 @@ import logging
 import pathlib
 
 import pandas as pd
+import torch
+from torch.utils.data import DataLoader
 
 from fpl_bot import (
     DataSource,
@@ -22,13 +24,15 @@ from fpl_bot import (
     FPLSourceConfig,
     FixtureSourceConfig,
     SeasonSequencer,
-    build_features,
+    build_features24,
+    build_features25,
     player_team_index,
+    Features,
 )
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    format="%(name)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -82,9 +86,7 @@ def _build_player_meta(
 # =============================================================================
 
 
-def _setup_season_24(
-    features: Features,
-) -> tuple[str, pd.DataFrame, pd.DataFrame, FPLSourceConfig, FPLSourceConfig, FixtureSourceConfig]:
+def _setup_season_24() -> tuple[str, pd.DataFrame, pd.DataFrame, FPLSourceConfig, FPLSourceConfig, FixtureSourceConfig]:
     """
     Load metadata and build configs for the 2024-2025 season.
 
@@ -93,9 +95,6 @@ def _setup_season_24(
         FPL_API/  -- Vaastav (stacked merged_gw.csv), base: player_idlist.csv
         OPTA/     -- per-GW playermatchstats, base: players.csv
         Fixtures/ -- per-GW matches, base: teams.csv
-
-    Args:
-        features: Feature registry built from this season's team codes.
 
     Returns:
         Tuple of (season_root, player_meta, teams_df,
@@ -171,12 +170,10 @@ def _setup_season_24(
         gw_filename="matches.csv",
     )
 
-    return season_root, player_meta, teams, fpl_cfg, opta_cfg, fixture_cfg
+    return season_root, player_meta, team_codes_df, fpl_cfg, opta_cfg, fixture_cfg
 
 
-def _setup_season_25(
-    features: Features,
-) -> tuple[str, pd.DataFrame, pd.DataFrame, FPLSourceConfig, FPLSourceConfig, FixtureSourceConfig]:
+def _setup_season_25() -> tuple[str, pd.DataFrame, pd.DataFrame, FPLSourceConfig, FPLSourceConfig, FixtureSourceConfig]:
     """
     Load metadata and build configs for the 2025-2026 season.
 
@@ -186,9 +183,6 @@ def _setup_season_25(
         fixtures.csv               -- fixture data
 
     Player and team metadata live in the season root folder.
-
-    Args:
-        features: Feature registry built from this season's team codes.
 
     Returns:
         Tuple of (season_root, player_meta, teams_df,
@@ -253,74 +247,7 @@ def _setup_season_25(
         gw_filename="fixtures.csv",
     )
 
-    return season_root, player_meta, teams, fpl_cfg, opta_cfg, fixture_cfg
-
-
-# =============================================================================
-# Season runner
-# =============================================================================
-
-
-def _run_season(
-    label: str,
-    season_root: str,
-    features: Features,
-    player_meta: pd.DataFrame,
-    teams: pd.DataFrame,
-    fpl_cfg: FPLSourceConfig,
-    opta_cfg: FPLSourceConfig,
-    fixture_cfg: FixtureSourceConfig,
-    gw_start: int,
-    gw_end: int,
-) -> None:
-    """
-    Build a SeasonSequencer, ingest a GW range, and build one player window.
-
-    Args:
-        label: Human-readable season label for logging (e.g. "24-25").
-        season_root: Path to the season data directory.
-        features: Feature registry for this season.
-        player_meta: Raw player metadata with position mapped to short codes.
-        teams: Teams DataFrame with code, name, elo, etc.
-        fpl_cfg: FPL API source config.
-        opta_cfg: OPTA source config.
-        fixture_cfg: Fixture source config.
-        gw_start: First gameweek to ingest (inclusive).
-        gw_end: Last gameweek to ingest (inclusive).
-    """
-    meta = _build_player_meta(player_meta, features)
-
-    seq = SeasonSequencer(
-        features=features,
-        season_root=season_root,
-        fpl_config_season=fpl_cfg,
-        opta_config=opta_cfg,
-        fixture_config=fixture_cfg,
-        player_meta=meta,
-        teams_df=teams,
-        window_size=8,
-    )
-
-    logger.info("Ingesting %s GW%d-%d...", label, gw_start, gw_end)
-    seq.ingest_player_range(gw_start, gw_end)
-    logger.info("Ingestion complete. %d players tracked.", len(seq._first_gw))
-
-    # Pick a player who appeared in the first gameweek.
-    gw1_players = [pid for pid, gw in seq._first_gw.items() if gw == gw_start]
-    if not gw1_players:
-        logger.error("No players found in GW%d (%s).", gw_start, label)
-        return
-
-    test_player = gw1_players[0]
-    logger.info("Building window for player: %s", test_player)
-
-    temporal, categorical = seq.build_player_window(test_player, gw_end)
-
-    logger.info("Temporal tensor shape:     %s", temporal.shape)
-    logger.info("Categorical tensor shape:  %s", categorical.shape)
-    logger.info("Temporal sample (row 0):   %s", temporal[0])
-    logger.info("%s smoke test passed.", label)
-
+    return season_root, player_meta, team_codes_df, fpl_cfg, opta_cfg, fixture_cfg
 
 # =============================================================================
 # Private helpers
@@ -347,50 +274,162 @@ def _resolve_teams_path(data_root: pathlib.Path) -> pathlib.Path:
 # Main
 # =============================================================================
 
+# categorical features for postion, 0 is left for padding
+_PLAYER_POS_ID = {
+    "GK": 1,
+    "DEF": 2,
+    "MID": 3,
+    "FWD": 4,
+}
 
 def main():
-    """Run the end-to-end pipeline smoke test for each season."""
-    seasons = [
-        ("24-25", DATA_ROOT_24, _setup_season_24),
-        ("25-26", DATA_ROOT_25, _setup_season_25),
-    ]
+    
+    # ─── 1. Set up Seasons ───
+    # ─── 1(a). 25/26 ───
 
-    for label, data_root, setup_fn in seasons:
-        # Load teams first to build Features (needs team codes for embeddings).
-        teams_path = _resolve_teams_path(data_root)
-        teams = pd.read_csv(teams_path)
-        team_codes = teams["code"].tolist()
-        features = build_features(team_codes)
+    season_root, player_meta, teams, fpl_cfg, opta_cfg, fixture_cfg = _setup_season_25()
+    features25 = build_features25(list(teams["team_code"]))
 
-        logger.info(
-            "%s — Features built: %d temporal, %d categorical",
-            label,
-            len(features.temporal_columns),
-            len(features.categorical_columns),
-        )
+    player_meta["position"] = player_meta["position"].map(_PLAYER_POS_ID)
+    features25._spec_by_name["position"].categories = [1, 2, 3, 4]
+    
+    # ─── 1(b). 24/25 ───
+    
+    # we inherit player_meta from 25/26 as we only need those players priors anyway
 
-        season_root, player_meta, teams_df, fpl_cfg, opta_cfg, fixture_cfg = (
-            setup_fn(features)
-        )
+    prior_season_root, defunc_player_meta, prior_teams, prior_fpl_cfg, prior_opta_cfg, prior_fixture_cfg = _setup_season_24()
+    features24 = build_features24(list(prior_teams["team_code"]))
 
-        _run_season(
-            label, season_root, features, player_meta, teams_df,
-            fpl_cfg, opta_cfg, fixture_cfg,
-            gw_start=1, gw_end=1,
-        )
+    features24._spec_by_name["position"].categories = [1, 2, 3, 4]
 
-    # -- Feature sanity check -------------------------------------------------
-    logger.info("--- Feature Sanity Check (last season) ---")
-    logger.info("Temporal features (%d columns):", len(features.temporal_columns))
-    for i, name in enumerate(features.temporal_columns):
-        logger.info("  [%d] %s", i, name)
+    # ─── 2. Get Priors ───
 
-    logger.info(
-        "Categorical features (%d columns):", len(features.categorical_columns),
+    prior_seq = SeasonSequencer(
+        features=features24,
+        season_root=prior_season_root,
+        fpl_config_season=prior_fpl_cfg,
+        opta_config=prior_opta_cfg,
+        fixture_config=prior_fixture_cfg,
+        player_meta=player_meta,
     )
-    for i, name in enumerate(features.categorical_columns):
-        logger.info("  [%d] %s", i, name)
 
+    prior_seq.ingest_range(1, 38)
+    priors = prior_seq.get_prior
+
+    # ─── 3. Set-up Current Season ───
+
+    seq = SeasonSequencer(
+        features=features25,
+        season_root=season_root,
+        fpl_config_season=fpl_cfg,
+        opta_config=opta_cfg,
+        fixture_config=fixture_cfg,
+        player_meta=player_meta,
+        prior_data=priors
+    )
+
+    seq.ingest_range(1, 16)
+
+    # ─── 4. Create train/val datasets with temporal split ───
+    # GW 2-24 for training, GW 25-29 for validation
+    # (GW 1 has no history, GW 30 is the last ingested target)
+
+    train_ds = seq.dataset(gw_start=2, gw_end=11)
+    val_ds   = seq.dataset(gw_start=12, gw_end=13)
+
+    print(f"Train samples: {len(train_ds)}")  # n_players * 23
+    print(f"Val samples:   {len(val_ds)}")    # n_players * 5
+
+
+    # ─── 5. Create DataLoaders ───
+
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+    val_loader   = DataLoader(val_ds, batch_size=64, shuffle=False)
+
+    # ─── Smoke test: inspect pipeline output ───
+    batch = next(iter(train_loader))
+    x_cont = batch["x_continuous"]
+    x_cat = batch["x_categorical"]
+    x_fix = batch["x_future_fixtures"]
+    y = batch["y"]
+
+    print(f"\n{'=' * 50}")
+    print("Sample batch from train_loader:")
+    print(f"  x_continuous:      {x_cont.shape}  dtype={x_cont.dtype}")
+    print(f"  x_categorical:     {x_cat.shape}  dtype={x_cat.dtype}")
+    print(f"  x_future_fixtures: {x_fix.shape}  dtype={x_fix.dtype}")
+    print(f"  y:                 {y.shape}  dtype={y.dtype}")
+    print()
+    print(f"  x_continuous NaN:  {torch.isnan(x_cont).sum().item()}")
+    print(f"  x_continuous Inf:  {torch.isinf(x_cont).sum().item()}")
+    print(f"  x_continuous min:  {x_cont.min().item():.4f}")
+    print(f"  x_continuous max:  {x_cont.max().item():.4f}")
+    print(f"  x_continuous mean: {x_cont.mean().item():.4f}")
+    print(f"  x_continuous std:  {x_cont.std().item():.4f}")
+    print(f"{'=' * 50}\n")
+
+    """    # ─── 6. Fit the scaler on training data ───
+    # Collect all training x_continuous into one tensor for fitting.
+    # This is a one-time operation before training starts.
+
+    all_x_continuous = []
+    for batch in train_loader:
+        all_x_continuous.append(batch["x_continuous"])
+
+    # Stack into [N_total, T, F] — this IS the [P, G, F] convention
+    all_x_continuous = torch.cat(all_x_continuous, dim=0)
+
+    scaler = FeatureScaler(features)
+    scaled_train, features_dict = scaler.train_scale(all_x_continuous)
+    # scaler is now fitted — scaling parameters stored in each FeatureSpec
+
+
+    # ─── 5. Training loop ───
+
+    model = ...       # your LSTM + MLP model
+    optimiser = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = torch.nn.MSELoss()
+
+    for epoch in range(num_epochs):
+        model.train()
+
+        for batch in train_loader:
+            # Unpack the batch — each value is a tensor with batch dim 0
+            x_cont = batch["x_continuous"]        # [B, T, F_cont]
+            x_cat  = batch["x_categorical"]       # [B, T, C]
+            x_fix  = batch["x_future_fixtures"]   # [B, K, fix_features]
+            y      = batch["y"]                   # [B, target_window_size]
+
+            # Scale continuous features using the fitted scaler
+            # test_scale uses parameters from train_scale — no data leakage
+            x_scaled = scaler.test_scale(x_cont)  # [B, T, F_cont]
+
+            # Forward pass — model handles embedding internally
+            pred = model(x_scaled, x_cat, x_fix)  # [B, 1]
+            loss = criterion(pred, y)
+
+            # Backward pass
+            optimiser.zero_grad()
+            loss.backward()
+            optimiser.step()
+
+        # ─── Validation ───
+        model.eval()
+        val_loss = 0.0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                x_cont = batch["x_continuous"]
+                x_cat  = batch["x_categorical"]
+                x_fix  = batch["x_future_fixtures"]
+                y      = batch["y"]
+
+                x_scaled = scaler.test_scale(x_cont)
+                pred = model(x_scaled, x_cat, x_fix)
+                val_loss += criterion(pred, y).item()
+
+        print(f"Epoch {epoch}: val_loss = {val_loss / len(val_loader):.4f}")
+    """
 
 if __name__ == "__main__":
     main()

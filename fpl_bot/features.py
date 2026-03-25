@@ -45,7 +45,8 @@ class DataSource(Enum):
     OPTA = "opta"
     FIXTURE = "fixture"
     # derived — computed internally by pipeline stages
-    INGESTER = "ingester"
+    OPTAINGESTER = "opta_ingester"
+    FPLINGESTER = "fpl_ingester"
     FIXINGESTER = "fixture_ingester"
     PRIOR = "prior"
     SEQUENCER = "sequencer"

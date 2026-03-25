@@ -44,8 +44,8 @@ def _build_common_specs(
 
     Args:
         team_codes: Integer team codes from teams.csv (e.g. [1, 2, … 20]).
-            Used as the category list for team_code and oppo_team_code
-            embeddings. Index 0 is reserved as padding_idx.
+            Used as the category list for the team_code embedding.
+            Index 0 is reserved as padding_idx.
         defcon_source: Source mapping for the defcon_per_90 feature.
             Differs between seasons (INGESTER for 24-25, FCI for 25-26).
 
@@ -64,7 +64,7 @@ def _build_common_specs(
     #   §5  Opta per-90 rates         (shots, passes, tackles, GK, …)
     #   §5b Derived per-90 rates      (defcon, …)
     #   §6  Fixture features          (team_elo, oppo_team_elo, is_home)
-    #   §7  Categorical embeddings    (position, team_code, oppo_team_code)
+    #   §7  Categorical embeddings    (position, team_code)
     # ═══════════════════════════════════════════════════════════════════════
 
     return [
@@ -743,6 +743,24 @@ def _build_common_specs(
         min_value=-1,
     ),
 
+    # num_matches — number of matches a team played in the GW (1 normal,
+    #   2 for a DGW).  Derived by FixtureProvider (FIXINGESTER) — each
+    #   fixture row is stamped with 1 before the DGW flatten sums them.
+    #   RAW_CUMULATIVE so the ingester carries a running total forward.
+    #   BOUNDED [0, 2] with BOUNDED scaling — the value is always 0, 1, or 2.
+    #   Blank gameweeks (no fixture) are 0 after the right-join fill.
+
+    FeatureSpec(
+        name="num_matches",
+
+        feature_type=FeatureType.BOUNDED,
+        scaling_mode=ScalingMode.BOUNDED,
+        accumulation=AccumulationType.RAW_CUMULATIVE,
+        temporal=True,
+        source={DataSource.FIXINGESTER: "num_matches"},
+        max_value=2,
+    ),
+
     # ── §7  Categorical embeddings ────────────────────────────────────────
     #
     # These become x_categorical — integer indices fed to nn.Embedding.
@@ -751,7 +769,10 @@ def _build_common_specs(
     #
     # position           — GKP/DEF/MID/FWD (4 categories + padding 0)
     # team_code          — player's own team (20 categories + padding 0)
-    # oppo_team_code    — who they're playing (20 categories + padding 0)
+    #
+    # Opponent identity is omitted: oppo_team_elo already conveys opponent
+    # strength, and a categorical code cannot be meaningfully averaged
+    # during DGW flattening.  May be reintroduced as an embedding later.
     #
     # Embedding dimensions follow a rough sqrt(n_categories) heuristic,
     # rounded up for power-of-2 friendliness.
@@ -776,16 +797,6 @@ def _build_common_specs(
         categories=team_codes,
         embedding_dim=8,
     ),
-    FeatureSpec(
-        name="oppo_team_code",
-        feature_type=FeatureType.CATEGORICAL,
-        scaling_mode=ScalingMode.IDENTITY,
-        accumulation=AccumulationType.NONE,
-        temporal=True,
-        source={DataSource.FIXTURE: "oppo_team_code"},
-        categories=team_codes,
-        embedding_dim=8,
-    ),
     ]
 
 def _build_specs24(team_codes: list[int]) -> list[FeatureSpec]:
@@ -800,7 +811,7 @@ def _build_specs24(team_codes: list[int]) -> list[FeatureSpec]:
     """
     return _build_common_specs(
         team_codes,
-        defcon_source={DataSource.INGESTER: "defcon_per_90"},
+        defcon_source={DataSource.OPTAINGESTER: "defcon_per_90"},
     )
 
 def _build_specs25(team_codes: list[int]) -> list[FeatureSpec]:
@@ -810,8 +821,8 @@ def _build_specs25(team_codes: list[int]) -> list[FeatureSpec]:
     Args:
         team_codes: Integer team codes from teams.csv.
 
-    Returns:
         Ordered list of FeatureSpec objects.
+    Returns:
     """
     return _build_common_specs(
         team_codes,
@@ -827,8 +838,7 @@ def build_features24(team_codes: list[int]) -> Features:
 
     Args:
         team_codes: Integer team codes from teams.csv (e.g. [1, 2, … 20]).
-            Passed through to categorical embedding specs for team_code
-            and oppo_team_code.
+            Passed through to the team_code categorical embedding spec.
 
     Returns:
         Features instance ready for the pipeline.
@@ -841,8 +851,7 @@ def build_features25(team_codes: list[int]) -> Features:
 
     Args:
         team_codes: Integer team codes from teams.csv (e.g. [1, 2, … 20]).
-            Passed through to categorical embedding specs for team_code
-            and oppo_team_code.
+            Passed through to the team_code categorical embedding spec.
 
     Returns:
         Features instance ready for the pipeline.

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import pandas as pd
+import numpy as np 
 
 from .features import Features, FeatureSpec, DataSource
 from .player_team_index import player_team_index
@@ -120,7 +121,10 @@ class FixtureProvider:
         home_df, away_df = self._add_is_home(home_df, away_df)
 
         # stack home and away teams, giving one row per team that played
-        gw_fixtures = pd.concat([home_df, away_df], axis=0)
+        gw_fixtures = pd.concat([home_df, away_df], axis=0).copy()
+
+        if self._derived_cols:
+            gw_fixtures = self._add_derived_cols(gw_fixtures)
 
         # if team didnt play add in blank row, 
         # is_home = -1 (0 = away, 0 != not playing)
@@ -128,11 +132,12 @@ class FixtureProvider:
 
         gw_fixtures = (
             gw_fixtures
-            .set_index("team_code", drop=False)     # indexes by team_code, but leaves as column for later use
-            .filter(items=self.output_cols)     # select only output columns
+            .filter(items=self.output_cols)         # select only output columns
             .round()                                # round any ELOs
-            .astype(int)                            # set as ints       
+            .astype(np.int64)                       # set as ints       
         )
+
+        gw_fixtures = self._flatten_dgw(gw_fixtures)
 
         self.features.validate_dataframe_from_source(
             gw_fixtures, self.output_cols, [self.cfg.provider], context=f"GW{gw}"
@@ -190,14 +195,48 @@ class FixtureProvider:
 
         return home_df, away_df
 
+    def _add_derived_cols(self, gw_fixtures: pd.DataFrame) -> pd.DataFrame:
+        """Requests specific derivations for fixture-ingester features."""
+        for feature in self._derived_cols:
+            if feature == "num_matches":
+                gw_fixtures = self._derive_num_matches(gw_fixtures, feature)
+
+        return gw_fixtures
+    
     def _join_team_universe(self, fixtures: pd.DataFrame) -> pd.DataFrame:
         """Right-join on team_codes so every known team has a row. -1 for missing is_home."""
         return (
             fixtures
             .merge(self.cfg.team_codes, on="team_code", how="right")  # ensure every team has a row
             .fillna({"is_home": -1})                                  # -1 signals team didn't play this GW
+            .fillna(0)
         )
 
+    def _flatten_dgw(self, gw_fixtures: pd.DataFrame) -> pd.DataFrame:
+        """Group by team_code and average for DGWs; sum-aggregated columns use sum instead."""
+        # columns that should be summed rather than averaged (e.g. num_matches: 1+1 = 2 in a DGW)
+        sum_cols = [c for c in self._derived_cols if c in gw_fixtures.columns]
+        avg_cols = [c for c in gw_fixtures.columns if c not in sum_cols and c != "team_code"]
+
+        grouped = gw_fixtures.groupby("team_code", as_index=False)
+        agg_map = {c: "mean" for c in avg_cols}
+        agg_map.update({c: "sum" for c in sum_cols})
+
+        gw_fixtures = (
+            grouped.agg(agg_map)
+            .set_index("team_code", drop=False)
+        )
+        return gw_fixtures
+
+    #================================================
+    # Feature Derivation Methods
+    #================================================
+
+    @staticmethod
+    def _derive_num_matches(gw_fixtures: pd.DataFrame, feature: str) -> pd.DataFrame:
+        """Stamp each fixture row with 1; DGW flatten sums to 2 for double gameweeks."""
+        gw_fixtures[feature] = 1
+        return gw_fixtures
 
 class GameweekProvider:
     """
@@ -223,10 +262,18 @@ class GameweekProvider:
         """
         self.features = features
         self.cfg = config
-        self.providers = [self.cfg.provider, DataSource.INGESTER]
         self.season_root = season_root
         self.cumulative_gw_data = None
-
+  
+        # providers: all the features.source contained in this class
+        # derive_cols: any features to be derived in provider
+        if self.cfg.provider == DataSource.OPTA:
+            self.providers = [self.cfg.provider, DataSource.OPTAINGESTER]  
+            self._derived_cols = list(features.output_columns_for([DataSource.OPTAINGESTER])) 
+        else:
+            self.providers = [self.cfg.provider, DataSource.FPLINGESTER] 
+            self._derived_cols = list(features.output_columns_for([DataSource.FPLINGESTER])) 
+        
         # check if stacked gw_data, one initial load saves time
         if self.cfg.stacked:
             self._stacked_data = pd.read_csv(self.season_root + self.cfg.gw_path)
@@ -234,6 +281,8 @@ class GameweekProvider:
         # generate column mapping dicts
         self.cum_map = features.cumulative_map_for(self.providers)
         self.cum_rev_map = features.inv_cumulative_map_for(self.providers)
+        self.source_map = features.source_map(self.cfg.provider)
+
 
         # generate snapshot, cumulative and output column names for provider
         # copy lists to avoid mutating the cached properties on the shared Features object
@@ -245,9 +294,6 @@ class GameweekProvider:
 
         # provider_cols: features this provider loads from CSV (used for numeric coercion)
         self._provider_cols = list(features.output_columns_for(self.cfg.provider))
-
-        # derive_cols: any features to be derived in provider
-        self._derived_cols = list(features.output_columns_for([DataSource.INGESTER]))
 
         # NOTE: featured is a synthetic internal only feature, so manually add
         self.output_cols.append("featured")
@@ -296,19 +342,18 @@ class GameweekProvider:
 
         gw_data = self._per_90_guard(gw_data)
 
-        # filter output columns, rename to output column names
-        gw_data = gw_data.rename(columns=self.cfg.player_id | self.cum_map)
-       
+        # add derived columns, if any
+        if self._derived_cols:
+            gw_data = self._add_derived_columns(gw_data)
+
+        # rename to output column names
+        gw_data = gw_data.rename(columns=self.cfg.player_id | self.source_map)
+   
         # coerce all output columns to numeric (real data may have string-typed floats)
-        # exclude "featured" — it is synthesised by _add_featured_col, not loaded from CSV
         gw_data = self._force_numeric_cols(gw_data, self._provider_cols)
 
         # featured = 1 if player has mins > 0, this will useful for averaging in priors
         gw_data = self._add_featured_col(gw_data)
-
-        # add derived columns, if any
-        if self._derived_cols:
-            gw_data = self._add_derived_columns(gw_data)
         
         gw_data = self._aggregate_dgw(gw_data)
 
@@ -340,6 +385,7 @@ class GameweekProvider:
         else:
             prefix = self.cfg.gw_path or ""
             gw_data = pd.read_csv(self.season_root + prefix + f"GW{gw}/{self.cfg.gw_filename}")
+            gw_data.attrs["source"] = self.cfg.gw_filename
 
         return gw_data
     
@@ -354,6 +400,7 @@ class GameweekProvider:
     def _force_numeric_cols(self, gw_data: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
         """Coerce specified columns to float, filling non-numeric values with 0.0."""
         missing = set(cols) - set(gw_data.columns)
+
         if missing:
             raise ValueError(f"Columns {missing} not found in gameweek data.")
         
@@ -364,7 +411,7 @@ class GameweekProvider:
 
     def _add_featured_col(self, gw_data: pd.DataFrame) -> pd.DataFrame:
         """Add a binary 'featured' column; 1 if the player had minutes > 0."""
-        gw_data["featured"] = (gw_data["minutes"] > 0).astype(int)
+        gw_data["featured"] = (gw_data["minutes"] > 0).astype(np.int64)
 
         return gw_data
 
@@ -434,7 +481,8 @@ class GameweekProvider:
     # Feature Derivation Methods
     #================================================
 
-    def _defcon_derivation(self, gw_data: pd.DataFrame, feature: str) -> pd.DataFrame:
+    @staticmethod
+    def _defcon_derivation(gw_data: pd.DataFrame, feature: str) -> pd.DataFrame:
         """Sum tackles, recoveries, blocks, and clearances into the defcon feature."""
         gw_data[feature] = gw_data[["tackles", "recoveries", "blocks", "clearances"]].sum(axis=1)
 
@@ -476,9 +524,19 @@ class Ingester:
         self.features = features
         self.season_root = season_root
         
-        self.providers = [fpl_config.provider, opta_config.provider, fixture_config.provider, DataSource.INGESTER, DataSource.FIXINGESTER]
-        self.output_cols = features.output_columns_for(self.providers)
+        self.player_providers = [
+            fpl_config.provider, 
+            opta_config.provider,  
+            DataSource.OPTAINGESTER, 
+            DataSource.FPLINGESTER,
+        ]
+        self.fixture_providers = [
+            fixture_config.provider,
+            DataSource.FIXINGESTER,
+        ]
 
+        self.player_output_cols = features.output_columns_for(self.player_providers)
+        self.fixture_output_cols = features.output_columns_for(self.fixture_providers)
         # initialise providers
         self.fpl_provider = GameweekProvider(features, fpl_config, season_root)
         self.opta_provider = GameweekProvider(features, opta_config, season_root)
@@ -487,8 +545,16 @@ class Ingester:
         # assign states for data storage
         self.player_gw_stats: dict[int, pd.DataFrame] = {}
         self.player_cumulative_stats: dict[int, pd.DataFrame] = {}
-        self.first_gw: dict[str, int] = {}
         self.fixtures: dict[int, pd.DataFrame] = {}
+
+        # players given first week 39 if they haven't played yet 
+        player_team_codes = fpl_config.id_map.copy()
+        player_team_codes = player_team_codes.assign(player_team_id=player_team_index)
+        player_team_codes["first_gw"] = 39
+        self._init_first_gw: dict[str, int] = dict(
+            zip(player_team_codes['player_team_id'], player_team_codes['first_gw'])
+        )
+        self.first_gw = self._init_first_gw.copy()
 
     #================================================
     # Player Data Ingestion
@@ -501,7 +567,8 @@ class Ingester:
         self.opta_provider.reset()
         self.player_cumulative_stats = {}
         self.player_gw_stats = {}
-        self.first_gw = {}
+
+        self.first_gw = self._init_first_gw.copy()
         return self
 
     def ingest(self, gameweek_start: int, gameweek_end: int) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
@@ -538,6 +605,7 @@ class Ingester:
         Returns:
             Tuple of (player_gw_stats, player_cumulative_stats) dicts.
         """
+
         self.player_gw_stats[gw], self.player_cumulative_stats[gw] = self._process_gw(gw)
         return self.player_gw_stats, self.player_cumulative_stats
 
@@ -557,7 +625,7 @@ class Ingester:
             Dict of {gameweek: fixture DataFrame}.
         """
         for gw in range(gameweek_start, gameweek_end + 1):
-            self.fixtures[gw] = self.fixture_provider.load_fixtures(gw)
+            self.fixtures[gw] = self.fixture_provider.load_fixtures(gw)[self.fixture_output_cols]
 
         return self.fixtures
 
@@ -600,7 +668,9 @@ class Ingester:
         # pandas search in C so quicker than if statement
         new_players = played.difference(self.first_gw.keys())
 
-        self.first_gw.update({pc: gw for pc in new_players})
+        for pc in new_players:
+            self.first_gw[pc] = gw
+
         return self
 
     def _process_gw(self, gw: int) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -616,7 +686,7 @@ class Ingester:
             self.opta_provider.cumulative_gw_data,
         )
         # ensure that gw_combined has columns ordered by convention
-        gw_combined = gw_combined[self.output_cols]
+        gw_combined = gw_combined[self.player_output_cols]
 
         self._update_first_gw(gw_combined, gw)
         return gw_combined, gw_cum_combined
