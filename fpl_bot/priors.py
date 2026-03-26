@@ -6,14 +6,12 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from sympy.core import Float
 
 from .features import Features, FeatureSpec, FeatureType, DataSource
 from .player_team_index import player_team_index
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_MIN_MINUTES = 450.0
-
 
 @dataclass
 class PriorData:
@@ -65,7 +63,8 @@ class PriorData:
         player_data: dict[int, pd.DataFrame],
         cumulative: dict[int, pd.DataFrame],
         player_meta: pd.DataFrame,
-        min_mins: float = DEFAULT_MIN_MINUTES,
+        min_mins_individual: float = 450.0,
+        min_mins_group: float = 90.0,
     ) -> "PriorData":
         """
         Convenience constructor — delegates to PriorComputer.
@@ -75,15 +74,16 @@ class PriorData:
             player_data: Per-GW features and per-90 rates from the ingester.
             cumulative: Raw cumulative counts per player per gameweek.
             player_meta: DataFrame with columns [player_code, position, team_code].
-            min_mins: Minimum cumulative minutes to qualify for individual priors.
+            min_mins_individual: Minimum cumulative minutes to qualify for individual priors.
+            min_mins_group: minimum cumulative minutes to qualify for contribution to a grouped prior.
 
         Returns:
             Computed PriorData instance.
         """
-        return PriorComputer(features, player_data, cumulative, player_meta, min_mins).compute()
+        return _PriorComputer(features, player_data, cumulative, player_meta, min_mins_individual, min_mins_group).compute()
 
 
-class PriorComputer:
+class _PriorComputer:
     """
     Computes hierarchical per-90 priors from ingester output.
 
@@ -97,7 +97,7 @@ class PriorComputer:
         player_meta:  DataFrame with [player_code, position, team_code].
         min_mins:     Minimum cumulative minutes for a player to qualify
                       for individual-level priors (default 450 ≈ 5 full matches).
-        cum_rev_map:  Maps cum_ columns to _per_90 columns for consistency with ingester.
+        min_mins_group: minimum cumulative minutes to qualify for contribution to a grouped prior.
     """
 
     def __init__(
@@ -106,22 +106,13 @@ class PriorComputer:
         player_data: dict[int, pd.DataFrame],
         cumulative: dict[int, pd.DataFrame],
         player_meta: pd.DataFrame,
-        min_mins: float = DEFAULT_MIN_MINUTES,
+        min_mins_individual: float,
+        min_mins_group: float,
     ):
-        """
-        Initialise the PriorComputer.
-
-        Args:
-            features: Global feature registry.
-            player_data: Per-GW features and per-90 rates from the ingester.
-            cumulative: Raw cumulative counts per player per gameweek, from the ingester.
-            player_meta: DataFrame with columns [player_code, position, team_code].
-            min_mins: Minimum cumulative minutes a player must have played to qualify
-                for individual-level priors. Default is 450 (approximately 5 full matches).
-        """
         self.cumulative = cumulative
         self.player_data = player_data
-        self.min_mins = min_mins
+        self.min_mins_ind = min_mins_individual 
+        self.min_mins_group = min_mins_group
         self.latest_gw = max(cumulative.keys())
 
         self._validate_input()
@@ -164,16 +155,16 @@ class PriorComputer:
         self.totals = self._extract_totals()
 
         # calculate position, position_team and individual
-        position = self._compute_level(group_cols=["position"])
-        pos_team = self._compute_level(group_cols=["position", "team_code"])    # NOTE: position team ordering is convention
-        players = self._compute_level(minutes_threshold=self.min_mins)
+        position = self._compute_level(group_cols=["position"], minutes_threshold=self.min_mins_group)
+        pos_team = self._compute_level(group_cols=["position", "team_code"], minutes_threshold=self.min_mins_group)    # NOTE: position team ordering is convention
+        players = self._compute_level(minutes_threshold=self.min_mins_ind)
 
         # add league groupby col and calculate league prior
         league_df = self.totals.copy()
         league_df["league"] = "league"
         # no minutes threshold as we want all contributions for league wide calc
-        league = self._compute_level(group_cols=["league"], input_df=league_df)
-
+        league = self._compute_level(group_cols=["league"], input_df=league_df, minutes_threshold=self.min_mins_group)
+        
         return PriorData(
             league=league,
             position=position,
@@ -181,7 +172,8 @@ class PriorComputer:
             individual=players,
             meta_data={
                 "latest_gw": self.latest_gw,
-                "min_minutes": self.min_mins,
+                "min_minutes_individual": self.min_mins_ind,
+                "min_minutes_group": self.min_mins_group,
                 "n_players_tot": len(self.player_meta),
                 "n_player_mins_req": len(players),
                 "snapshot_cols": self.features.snapshot_columns,
@@ -254,7 +246,7 @@ class PriorComputer:
             df[self.snapshot_cols]
             .multiply(df["minutes"], axis=0)
             .groupby(level=0)
-            .sum()
+            .sum(numeric_only=True)
         )
 
     def _normalise_weighted_sums(self, df: pd.DataFrame, group: dict) -> pd.DataFrame:
@@ -263,7 +255,7 @@ class PriorComputer:
         grouped = (
             df
             .groupby(**group)
-            .sum()
+            .sum(numeric_only=True)
         )
         return (
             grouped[self.snapshot_cols]
@@ -285,11 +277,20 @@ class PriorComputer:
         # for cumulative data we just want most recent count
         cumulative = self.cumulative[max(self.cumulative.keys())]
 
-        # combine
+        # combine — fillna covers players in meta but missing from data
         output = (
             pd.concat([self.player_meta, cumulative, snapshot_features], axis=1)
             .fillna(0.0)
         )
+
+        # drop players not in player_meta (they have no position/team metadata,
+        # and fillna would have set position to 0.0 which is reserved for padding)
+        output = output.loc[output.index.isin(self.player_meta.index)]
+
+        # restore int dtype for groupby columns (fillna upcasts int → float)
+        output["position"] = output["position"].astype(int)
+        output["team_code"] = output["team_code"].astype(int)
+
         return output
 
     def _compute_level(
@@ -331,7 +332,7 @@ class PriorComputer:
         cum_df = (
             df
             .groupby(**group)
-            .sum()
+            .sum(numeric_only=True)
         )
         per_90 = self._per_90_calculation(cum_df)
 

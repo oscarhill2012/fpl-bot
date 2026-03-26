@@ -17,6 +17,8 @@ _EPS = 1e-8
 class FeatureType(Enum):
     GAUSSIAN = "gaussian"                 # symmetric continuous
     SKEWED_POSITIVE = "skewed_positive"   # heavy right tail
+    SKEWED = "skewed"                     # heavy tail, but goes negative
+    BIMODAL = "bimodal"                   # two peaks
     COUNT = "count"                       # sparse non-negative integers
     BOUNDED = "bounded"                   # known min/max
     BINARY = "binary"                     # 0/1
@@ -550,6 +552,22 @@ class Features:
                 return i
         raise KeyError(f"No feature named '{name}'")
 
+    def index_from(self, index: int) -> str:
+        """
+        Return name of feature at index.
+
+        Args:
+            index: requested index
+
+        Returns: 
+            string name of feature at index
+
+        Raises:
+            KeyError: if no feature of index
+        """
+
+        return self.specs[index].name
+        
     @property
     def specs_by_mode(self) -> dict[ScalingMode, list[FeatureSpec]]:
         """Group specs by their scaling mode."""

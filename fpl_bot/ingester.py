@@ -251,6 +251,7 @@ class GameweekProvider:
         features: Features,
         config: FPLSourceConfig,
         season_root: str,
+        minimum_minutes: int = 45,
     ):
         """
         Initialise a GameweekProvider.
@@ -259,10 +260,14 @@ class GameweekProvider:
             features: Global feature registry.
             config: Source configuration for this provider.
             season_root: Path to the season data directory.
+            minimum_minutes: Cumulative minutes threshold before per-90 rates
+                are calculated. Players below this threshold keep per-90
+                columns at zero to avoid extreme outliers.
         """
         self.features = features
         self.cfg = config
         self.season_root = season_root
+        self.minimum_minutes = minimum_minutes
         self.cumulative_gw_data = None
   
         # providers: all the features.source contained in this class
@@ -364,9 +369,9 @@ class GameweekProvider:
 
         self._update_cumulative_frame(gw_data)
 
-        # only per_90ify if minutes not 0, no div by 0
-        # uses cumulative df to carry forward players per_90 rates even if they did no feature in gw
-        mask = self.cumulative_gw_data["cum_minutes"] > 0.0
+        # only per_90ify if player has accrued enough cumulative minutes
+        # suppresses extreme outliers from low-minute players
+        mask = self.cumulative_gw_data["cum_minutes"] >= self.minimum_minutes
 
         if self.per_90_cols and mask.any():
             gw_data = self._calculate_per_90(gw_data, mask, self.per_90_cols)
@@ -510,6 +515,7 @@ class Ingester:
         fpl_config: FPLSourceConfig,
         opta_config: FPLSourceConfig,
         fixture_config: FixtureSourceConfig,
+        minimum_minutes: int = 45,
     ):
         """
         Initialise the Ingester with FPL and Opta data providers.
@@ -520,6 +526,8 @@ class Ingester:
             fpl_config: Source configuration for the FPL/Vaastav data.
             opta_config: Source configuration for the Opta data.
             fixture_config: Source configuration for fixture/Elo data.
+            minimum_minutes: Cumulative minutes threshold before per-90 rates
+                are calculated. Passed to each GameweekProvider.
         """
         self.features = features
         self.season_root = season_root
@@ -538,8 +546,8 @@ class Ingester:
         self.player_output_cols = features.output_columns_for(self.player_providers)
         self.fixture_output_cols = features.output_columns_for(self.fixture_providers)
         # initialise providers
-        self.fpl_provider = GameweekProvider(features, fpl_config, season_root)
-        self.opta_provider = GameweekProvider(features, opta_config, season_root)
+        self.fpl_provider = GameweekProvider(features, fpl_config, season_root, minimum_minutes)
+        self.opta_provider = GameweekProvider(features, opta_config, season_root, minimum_minutes)
         self.fixture_provider = FixtureProvider(features, fixture_config, season_root)
 
         # assign states for data storage
@@ -660,19 +668,6 @@ class Ingester:
 
         return pd.concat([fpl, opta], axis=1)
 
-    def _update_first_gw(self, gw_combined: pd.DataFrame, gw: int) -> "Ingester":
-        """Record the first gameweek each player appeared in."""
-        # isolate players that played this gameweek
-        played = gw_combined.index[gw_combined["minutes"] > 0]
-
-        # pandas search in C so quicker than if statement
-        new_players = played.difference(self.first_gw.keys())
-
-        for pc in new_players:
-            self.first_gw[pc] = gw
-
-        return self
-
     def _process_gw(self, gw: int) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Load and merge FPL and Opta data for a single gameweek."""
         # uses instances of GameweekProvider to load gw
@@ -690,3 +685,19 @@ class Ingester:
 
         self._update_first_gw(gw_combined, gw)
         return gw_combined, gw_cum_combined
+
+    def _update_first_gw(self, gw_combined: pd.DataFrame, gw: int) -> "Ingester":
+        """Record the first gameweek each player appeared in."""
+        # isolate players that played this gameweek
+        played_this_gw = gw_combined.index[gw_combined["minutes"] > 0]
+
+        # players that haven't played are labelled with first gw = 39
+        played_previously = {key: value for key, value in self.first_gw.items() if value != 39}
+  
+        # pandas search in C so quicker than if statement
+        new_players = played_this_gw.difference(played_previously.keys())
+
+        for pc in new_players:
+            self.first_gw[pc] = gw
+
+        return self

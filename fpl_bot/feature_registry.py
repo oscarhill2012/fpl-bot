@@ -117,7 +117,7 @@ def _build_common_specs(
     FeatureSpec(
         name="minutes",
 
-        feature_type=FeatureType.SKEWED_POSITIVE,
+        feature_type=FeatureType.BIMODAL,
         scaling_mode=ScalingMode.ROBUST,
         accumulation=AccumulationType.RAW_CUMULATIVE,
         temporal=True,
@@ -164,11 +164,11 @@ def _build_common_specs(
     FeatureSpec(
         name="points",
 
-        feature_type=FeatureType.GAUSSIAN,
-        scaling_mode=ScalingMode.LINEAR,
+        feature_type=FeatureType.SKEWED,
+        scaling_mode=ScalingMode.ROBUST,
         accumulation=AccumulationType.NONE,
         temporal=True,
-        source={DataSource.VAASTAV: "total_points", DataSource.FCI: "total_points"},
+        source={DataSource.VAASTAV: "total_points", DataSource.FCI: "event_points"},
     ),
     FeatureSpec(
         name="transfers_in",
@@ -636,7 +636,7 @@ def _build_common_specs(
         name="sweeper_actions_per_90",
 
         feature_type=FeatureType.SKEWED_POSITIVE,
-        scaling_mode=ScalingMode.LOG_ROBUST,
+        scaling_mode=ScalingMode.ROBUST,
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.OPTA: "sweeper_actions"},
@@ -645,7 +645,7 @@ def _build_common_specs(
         name="high_claim_per_90",
 
         feature_type=FeatureType.SKEWED_POSITIVE,
-        scaling_mode=ScalingMode.LOG_ROBUST,
+        scaling_mode=ScalingMode.ROBUST,
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.OPTA: "high_claim"},
@@ -663,7 +663,7 @@ def _build_common_specs(
         name="gk_accurate_long_balls_per_90",
 
         feature_type=FeatureType.SKEWED_POSITIVE,
-        scaling_mode=ScalingMode.LOG_ROBUST,
+        scaling_mode=ScalingMode.ROBUST,
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.OPTA: "gk_accurate_long_balls"},

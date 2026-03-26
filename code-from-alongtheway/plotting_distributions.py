@@ -17,7 +17,6 @@ from fpl_bot import (
     build_features25,
     player_team_index,
     Features,
-    FeatureScaler,
 )
 
 logging.basicConfig(
@@ -316,14 +315,13 @@ def main():
         prior_data=priors
     )
 
-    seq.ingest_range(1, 29)
+    seq.ingest_range(1, 21)
 
     # ─── 4. Create train/val datasets with temporal split ───
     # GW 2-24 for training, GW 25-29 for validation
     # (GW 1 has no history, GW 30 is the last ingested target)
 
-    train_ds = seq.dataset(gw_start=2, gw_end=23)
-    val_ds = seq.dataset(gw_start=24, gw_end=29)
+    train_ds = seq.dataset(gw_start=2, gw_end=19)
     
 
     print(f"Train samples: {len(train_ds)}")  # n_players * 23
@@ -332,71 +330,61 @@ def main():
 
     # ─── 5. Create DataLoaders ───
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=64, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=14796, shuffle=True)
+    #val_loader   = DataLoader(val_ds, batch_size=64, shuffle=False)
 
-    # ─── 6. Fit the scaler on training data ───
-    # Collect all training x_continuous into one tensor for fitting.
-    # This is a one-time operation before training starts.
+    # ─── Smoke test: inspect pipeline output ───
 
-    all_x_continuous = []
-    for batch in train_loader:
-        all_x_continuous.append(batch["x_continuous"])
+    batch = next(iter(train_loader))
+    x_cont = batch["x_continuous"]
+    x_cat = batch["x_categorical"]
+    x_fix = batch["x_future_fixtures"]
+    y = batch["y"]
 
-    # Stack into [N_total, T, F] — this IS the [P, G, F] convention
-    all_x_continuous = torch.cat(all_x_continuous, dim=0)
+    # ─── Check for negative transfers ───
 
-    scaler = FeatureScaler(features25)
-    scaled_train, features_dict = scaler.train_scale(all_x_continuous)
-    # scaler is now fitted — scaling parameters stored in each FeatureSpec
+    cont_names = features25.temporal_columns
+    flat_check = x_cont.reshape(-1, x_cont.shape[-1])
 
+    for col_name in ("transfers_in", "transfers_out"):
+        idx = cont_names.index(col_name)
+        neg_count = (flat_check[:, idx] < 0).sum().item()
+        if neg_count > 0:
+            logger.warning(
+                "%s contains %d negative values (min=%.2f).",
+                col_name, neg_count, flat_check[:, idx].min().item(),
+            )
+        else:
+            logger.info("%s — no negative values found.", col_name)
 
-"""    # ─── 5. Training loop ───
+    # ─── Plot continuous features as histograms ───
+    n_features = x_cont.shape[-1]
+    plot_cols = 8
+    plot_rows = math.ceil(n_features / plot_cols)
 
-    model = ...       # your LSTM + MLP model
-    optimiser = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = torch.nn.MSELoss()
+    fig, axes = plt.subplots(plot_rows, plot_cols, figsize=(4 * plot_cols, 3 * plot_rows))
+    axes = axes.flatten()
 
-    for epoch in range(num_epochs):
-        model.train()
+    # Flatten batch and time dimensions to get per-feature distributions
+    flat = x_cont.reshape(-1, n_features)
 
-        for batch in train_loader:
-            # Unpack the batch — each value is a tensor with batch dim 0
-            x_cont = batch["x_continuous"]        # [B, T, F_cont]
-            x_cat  = batch["x_categorical"]       # [B, T, C]
-            x_fix  = batch["x_future_fixtures"]   # [B, K, fix_features]
-            y      = batch["y"]                   # [B, target_window_size]
+    for i in range(n_features):
 
-            # Scale continuous features using the fitted scaler
-            # test_scale uses parameters from train_scale — no data leakage
-            x_scaled = scaler.test_scale(x_cont)  # [B, T, F_cont]
+        ax = axes[i]
+        values = flat[:, i].numpy()
+        ax.hist(values, bins=40, edgecolor="black", linewidth=0.4)
+        ax.set_yscale("log")
+        ax.set_title(cont_names[i], fontsize=9)
+        ax.tick_params(labelsize=7)
 
-            # Forward pass — model handles embedding internally
-            pred = model(x_scaled, x_cat, x_fix)  # [B, 1]
-            loss = criterion(pred, y)
+    # Hide unused subplots
+    for j in range(n_features, len(axes)):
+        axes[j].set_visible(False)
 
-            # Backward pass
-            optimiser.zero_grad()
-            loss.backward()
-            optimiser.step()
+    fig.suptitle("Continuous Feature Distributions", fontsize=12)
+    fig.tight_layout(pad=2.0, w_pad=1.5, h_pad=2.0)
+    plt.show()
 
-        # ─── Validation ───
-        model.eval()
-        val_loss = 0.0
-
-        with torch.no_grad():
-            for batch in val_loader:
-                x_cont = batch["x_continuous"]
-                x_cat  = batch["x_categorical"]
-                x_fix  = batch["x_future_fixtures"]
-                y      = batch["y"]
-
-                x_scaled = scaler.test_scale(x_cont)
-                pred = model(x_scaled, x_cat, x_fix)
-                val_loss += criterion(pred, y).item()
-
-        print(f"Epoch {epoch}: val_loss = {val_loss / len(val_loader):.4f}")
-"""
 
 if __name__ == "__main__":
     main()

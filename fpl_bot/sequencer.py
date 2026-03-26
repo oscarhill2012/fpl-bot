@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 from .features import Features, FeatureSpec, FeatureType, DataSource
 from .ingester import Ingester, FPLSourceConfig, FixtureSourceConfig
 from .player_team_index import player_team_index
-from .priors import PriorComputer, PriorData
+from .priors import PriorData
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +184,7 @@ class SeasonSequencer:
         self._ingester.ingest(gw_start, gw_end)
 
         self._first_gw = self._ingester.first_gw
+
         self._current_gameweek = gw_end
 
         # add new data to gw_cache
@@ -196,7 +197,6 @@ class SeasonSequencer:
                 self._ingester.player_gw_stats,
                 self._ingester.player_cumulative_stats,
                 pd.DataFrame.from_dict(self._player_meta, orient="index"),
-                min_mins=450.0
             )
             self._prior_data.to_json(self.season_root)
 
@@ -389,9 +389,8 @@ class SeasonSequencer:
         else:
             prior_row = {**self._prior_data.league["league"]}
 
-        # add row to denote prior, "data_age" is sentinel
-        prior_row["is_prior"], prior_row["data_age"] = 1.0, 0.0
-
+        # add row to denote prior, "data_age" is sentinel to be populated later
+        prior_row["is_prior"], prior_row["data_age"] = 1, 0.0
         return prior_row
 
     @staticmethod
@@ -405,7 +404,7 @@ class SeasonSequencer:
         real_row = {**self.player_cache[gw][player_team_code]}
 
         # add row to denote prior, "data_age" is sentinel
-        real_row["is_prior"], real_row["data_age"] = 0.0, 0.0
+        real_row["is_prior"], real_row["data_age"] = 0, 0.0
         return real_row
 
     def _build_input_window(
