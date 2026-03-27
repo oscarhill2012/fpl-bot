@@ -244,19 +244,15 @@ class Features:
             specs: List of feature specifications. Will be reordered so
                 categoricals come last before freezing.
         """
-        # auto-sort: continuous specs first, categorical specs last
-        continuous = [s for s in specs if s.feature_type != FeatureType.CATEGORICAL]
+        # auto-sort: numeric specs first, categorical specs last
+        numeric = [s for s in specs if s.feature_type != FeatureType.CATEGORICAL]
         categorical = [s for s in specs if s.feature_type == FeatureType.CATEGORICAL]
-        self.specs = tuple(continuous + categorical)
+        self.specs = tuple(numeric + categorical)
 
         self._validate()
 
         # prebuild lookup
         self._spec_by_name: dict[str, FeatureSpec] = {s.name: s for s in self.specs}
-        # tensor masks
-        self.scaling_masks = self._build_mode_masks()       # builds tensor, a mask for each scaling mode, shape = [n_features]
-        self.type_masks = self._build_type_mask()           # builds tensor, a mask for each feature type, shape = [n_features]
-        self.temporal_mask = self._temporal_mask()          # builds tensor, a temporal mask, True is temporal, shape = [n_features]
 
     #================================================
     # Validation
@@ -309,8 +305,8 @@ class Features:
         ]
 
     @cached_property
-    def temporal_columns(self) -> list[str]:
-        """Feature names for continuous (non-categorical) features; defines the scaled tensor columns."""
+    def numeric_columns(self) -> list[str]:
+        """Feature names for numeric (non-categorical) features; defines the scaled tensor columns."""
         return [s.name for s in self.specs if s.feature_type != FeatureType.CATEGORICAL]
 
     @cached_property
@@ -319,7 +315,7 @@ class Features:
         return [s.name for s in self.specs if s.feature_type == FeatureType.CATEGORICAL]
 
     @cached_property
-    def continuous_indices(self) -> list[int]:
+    def numeric_indices(self) -> list[int]:
         """Indices into specs for non-CATEGORICAL features."""
         return [i for i, s in enumerate(self.specs) if s.feature_type != FeatureType.CATEGORICAL]
 
@@ -348,6 +344,39 @@ class Features:
         """Feature names accumulated but not per-90 divided; typically 'minutes' and 'featured'."""
         return [s.name for s in self.specs if s.accumulation == AccumulationType.RAW_CUMULATIVE]
 
+    #================================================
+    # Provide Filtered Instance
+    # returns instance of features, filtered by condition
+    #================================================
+
+    @property
+    def filtered_categoric(self) -> "Features":
+        """
+        Provides new instance of only categoric features.
+        
+        Used to select features that require embedding.
+
+        Returns:
+            Instance of Features, for only categorics
+        """
+        return Features(
+            [self._spec_by_name[name] for name in self.categorical_columns]
+        )
+
+    @property    
+    def filtered_numeric(self) -> "Features":
+        """
+        Provides new instance of only numeric features.
+        
+        Used to select features that require scaling.
+
+        Returns:
+            Instance of Features, for only numerics
+        """
+        return Features(
+            [self._spec_by_name[name] for name in self.numeric_columns]
+        )
+        
     #================================================
     # Provider-Filtered Column Lists
     # Column lists narrowed to features supplied by a specific DataSource.
@@ -696,30 +725,28 @@ class Features:
 
     #================================================
     # Tensor Mask Builders
-    # Private methods called once at initialisation to create boolean
-    # tensors used by the scaling and encoding layers.
     #================================================
 
-    def _temporal_mask(self) -> torch.Tensor:
-        """Build boolean mask selecting temporal features."""
+    def temporal_mask(self) -> torch.Tensor:
+        """
+        Build boolean mask selecting temporal features.
+ 
+        Returns:
+            Boolean mask true for each temporal feature.
+        """
         return torch.tensor([s.temporal for s in self.specs])
 
-    def _build_mode_masks(self) -> dict[ScalingMode, torch.Tensor]:
-        """Build boolean masks for each scaling mode."""
+    def build_scaling_masks(self) -> dict[ScalingMode, torch.Tensor]:
+        """
+        Builds boolean masks for each scaling mode.
+        
+        Returns:
+            Scaling masks for each scaling mode; dict[ScalingMode, Tensor]
+        """
         masks = {}
         for mode in ScalingMode:
             masks[mode] = torch.tensor(
                 [s.scaling_mode == mode for s in self.specs],
-                dtype=torch.bool
-            )
-        return masks
-
-    def _build_type_mask(self) -> dict[FeatureType, torch.Tensor]:
-        """Build boolean masks for each feature type."""
-        masks = {}
-        for ftype in FeatureType:
-            masks[ftype] = torch.tensor(
-                [s.feature_type == ftype for s in self.specs],
                 dtype=torch.bool
             )
         return masks

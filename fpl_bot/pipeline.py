@@ -516,7 +516,9 @@ _MODE_TO_SCALER = {
 
 class FeatureScaler:
     """
-    Mask-aware scaler for tensors of shape [batch, time, features].
+    Mask-aware scaler for tensors of shape [batch, time, numneric_features].
+    
+    Handles all scaling for numeric features.
 
     Orchestrates multiple underlying scalers, one per ScalingMode, applying
     each only to the features it governs. Handles presence masking so that
@@ -529,8 +531,7 @@ class FeatureScaler:
 
     def __init__(
         self,
-        features_cls: Features,
-        scaling_masks: dict[ScalingMode, torch.Tensor],
+        features: Features,
         eps: float = 1e-8,
         device: str = 'cpu',
     ):
@@ -543,16 +544,20 @@ class FeatureScaler:
             eps: Small value for numerical stability in underlying scalers.
             device: Torch device string; all tensors are moved here.
         """
-        self.features = features_cls
+        self.features = features
         self.eps = eps
         self.device = device
-        # this class generates scaling mask and presence_mask
-        self.scaling_masks = {mode: mask.to(self.device) for mode, mask in scaling_masks.items()}
+
+        # generates scaling and presence masks 
+        self.scaling_masks = features.build_scaling_masks()
         self._build_presence_indices()
+
         # specs gives dict{ScalingMode: list of feature names for that mode}
         self.specs_by_mode = self.features.specs_by_mode
+
         # bound tensor is collection of min and max for bound scaling
         self._build_bound_tensor()
+
         # _fitted now refers to the collection of scalers generated upon init
         self._fitted = False
 
@@ -571,6 +576,45 @@ class FeatureScaler:
                     min_value=self.min_vals,
                     max_value=self.max_vals,
                 )
+
+    #================================================
+    # init Helpers
+    #================================================
+
+    def _validate_input(self, x: torch.Tensor):
+        """Validate that the input tensor has the correct shape, type, and contains only finite values."""
+        if not isinstance(x, torch.Tensor):
+            raise TypeError('Input must be a tensor')
+        if not torch.is_floating_point(x):
+            raise TypeError(f'Input must be type float, received {x.dtype}')
+        if x.dim() != 3:
+            raise ValueError(f'Expected shape [Batch, Time, numeric_Features], received {x.shape}')
+        if not x.shape[-1] == len(self.features):
+            # masks generated internally, so check features give correct shape
+            raise RuntimeError('Tensor[Features] dimensions do not match len(features.specs)')
+        if not torch.isfinite(x).all().item():
+            raise ValueError('Input tensor contains NaN or infinite value(s).')
+
+    def _build_bound_tensor(self):
+        """Collect min and max values from bounded specs into tensors for _BoundedScaler."""
+        min_vals = []
+        max_vals = []
+
+        for feature in self.features.specs:
+            if feature.scaling_mode == ScalingMode.BOUNDED:
+                max_vals.append(feature.max_value)
+                min_vals.append(feature.min_value)
+
+        # None makes bound scaler set to 0s
+        if not max_vals:
+            self.max_vals = None
+            self.min_vals = None
+            return self
+
+        # _BoundedScaler requires tensor input [1, n_scaled_features], even if None
+        self.max_vals = torch.tensor(max_vals, dtype=torch.float32).unsqueeze(0)
+        self.min_vals = torch.tensor(min_vals, dtype=torch.float32).unsqueeze(0)
+        return self
 
     #================================================
     # Public Functions
@@ -601,15 +645,16 @@ class FeatureScaler:
         x_present = x[presence_mask]
         for mode, scaler in self._scalers.items():
             x_present[:, self.scaling_masks[mode]] = scaler.fit_transform(x_present[:, self.scaling_masks[mode]])
-            param1, param2 = scaler.params
 
-            for spec, p1, p2 in zip(self.specs_by_mode[mode], param1[0], param2[0], strict=True):
-                spec.scaling_params = [p1.item(), p2.item()]
+            param1, param2 = scaler.params
+            self._append_params(mode, param1, param2)
 
         # write back scaled values for present rows
         x[presence_mask] = x_present
+
         # now fitted
         self._fitted = True
+
         # return scaled tensor shape = [n_samples, n_timesteps, n_features], and return features dict, now with scaling params
         # features dict must be given with x as this is the meta data for tensor
         return x, self.features.to_dict()
@@ -685,41 +730,6 @@ class FeatureScaler:
     # Private Helpers
     #================================================
 
-    def _validate_input(self, x: torch.Tensor):
-        """Validate that the input tensor has the correct shape, type, and contains only finite values."""
-        if not isinstance(x, torch.Tensor):
-            raise TypeError('Input must be a tensor')
-        if not torch.is_floating_point(x):
-            raise TypeError(f'Input must be type float, received {x.dtype}')
-        if x.dim() != 3:
-            raise ValueError(f'Expected shape [Batch, Time, Feature], received {x.shape}')
-        if not x.shape[-1] == len(self.features):
-            # masks generated internally, but double check
-            raise RuntimeError('Tensor[Features] dimensions do not match Mask Dimensions')
-        if not torch.isfinite(x).all().item():
-            raise ValueError('Input tensor contains NaN or infinite value(s).')
-
-    def _build_bound_tensor(self):
-        """Collect min and max values from bounded specs into tensors for _BoundedScaler."""
-        min_vals = []
-        max_vals = []
-
-        for feature in self.features.specs:
-            if feature.scaling_mode == ScalingMode.BOUNDED:
-                max_vals.append(feature.max_value)
-                min_vals.append(feature.min_value)
-
-        # None makes bound scaler set to 0s
-        if not max_vals:
-            self.max_vals = None
-            self.min_vals = None
-            return self
-
-        # _BoundedScaler requires tensor input [1, n_scaled_features], even if None
-        self.max_vals = torch.tensor(max_vals, dtype=torch.float32).unsqueeze(0)
-        self.min_vals = torch.tensor(min_vals, dtype=torch.float32).unsqueeze(0)
-        return self
-
     def _build_presence_indices(self):
         """Build index tensors for presence-checked features, used in presence masking."""
         # presence indices built from features input upon initialisation
@@ -754,3 +764,10 @@ class FeatureScaler:
         x_check = x[:,:, self._presence_indices].to(self.device)
         mask = (x_check > self._presence_min_values).all(dim=-1)
         return mask
+
+    def _append_params(self, mode: ScalingMode, param1: float, param2: float) -> "FeatureScaler":
+        """Adds params to features instance"""
+        for spec, p1, p2 in zip(self.specs_by_mode[mode], param1[0], param2[0], strict=True):
+            spec.scaling_params = [p1.item(), p2.item()]
+
+        return self

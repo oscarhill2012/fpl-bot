@@ -316,40 +316,69 @@ def main():
         prior_data=priors
     )
 
-    seq.ingest_range(1, 29)
+    seq.ingest_range(1, 30)
 
     # ─── 4. Create train/val datasets with temporal split ───
     # GW 2-24 for training, GW 25-29 for validation
     # (GW 1 has no history, GW 30 is the last ingested target)
 
-    train_ds = seq.dataset(gw_start=2, gw_end=23)
+    train_ds = seq.dataset(gw_start=2, gw_end=23) 
     val_ds = seq.dataset(gw_start=24, gw_end=29)
     
 
     print(f"Train samples: {len(train_ds)}")  # n_players * 23
-    #print(f"Val samples:   {len(val_ds)}")    # n_players * 5
-
+    print(f"Val samples:   {len(val_ds)}")    # n_players * 5
 
     # ─── 5. Create DataLoaders ───
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)  
     val_loader   = DataLoader(val_ds, batch_size=64, shuffle=False)
-
-    # ─── 6. Fit the scaler on training data ───
-    # Collect all training x_continuous into one tensor for fitting.
+ 
+    # ─── 6. Fit the scaler on training data ─── 
+    # Collect all training x_numeric into one tensor for fitting. 
     # This is a one-time operation before training starts.
-
-    all_x_continuous = []
+ 
+    all_x_numeric = [] 
     for batch in train_loader:
-        all_x_continuous.append(batch["x_continuous"])
 
-    # Stack into [N_total, T, F] — this IS the [P, G, F] convention
-    all_x_continuous = torch.cat(all_x_continuous, dim=0)
+        all_x_numeric.append(batch["x_numeric"])  
+ 
+    # Stack into [N_total, T, F] — this IS the [P, G, F] convention 
+    all_x_numeric = torch.cat(all_x_numeric, dim=0)  
 
-    scaler = FeatureScaler(features25)
-    scaled_train, features_dict = scaler.train_scale(all_x_continuous)
+    scaled_features = features25.filtered_numeric
+    scaler = FeatureScaler(scaled_features)
+    scaled_train, features_dict = scaler.train_scale(all_x_numeric)
     # scaler is now fitted — scaling parameters stored in each FeatureSpec
 
+    # ─── Plot continuous features as histograms ───
+    n_features = scaled_train.shape[-1]
+    numeric_names = scaled_features.numeric_columns
+    plot_cols = 8
+    plot_rows = math.ceil(n_features / plot_cols)
+
+    fig, axes = plt.subplots(plot_rows, plot_cols, figsize=(4 * plot_cols, 3 * plot_rows))
+    axes = axes.flatten()
+
+    # Flatten batch and time dimensions to get per-feature distributions
+    flat = scaled_train.reshape(-1, n_features)
+
+    for i in range(n_features):
+
+        ax = axes[i]
+        values = flat[:, i].numpy()
+        ax.hist(values, bins=40, edgecolor="black", linewidth=0.4)
+        ax.set_yscale("log")
+        ax.set_title(numeric_names[i], fontsize=9)
+        ax.tick_params(labelsize=7)
+
+    # Hide unused subplots
+    for j in range(n_features, len(axes)):
+        axes[j].set_visible(False)
+
+    fig.suptitle("Numeric Feature Distributions", fontsize=12)
+    fig.tight_layout(pad=2.0, w_pad=1.5, h_pad=2.0)
+    plt.show()
 
 """    # ─── 5. Training loop ───
 
@@ -362,12 +391,12 @@ def main():
 
         for batch in train_loader:
             # Unpack the batch — each value is a tensor with batch dim 0
-            x_cont = batch["x_continuous"]        # [B, T, F_cont]
+            x_cont = batch["x_numeric"]        # [B, T, F_cont]
             x_cat  = batch["x_categorical"]       # [B, T, C]
             x_fix  = batch["x_future_fixtures"]   # [B, K, fix_features]
             y      = batch["y"]                   # [B, target_window_size]
 
-            # Scale continuous features using the fitted scaler
+            # Scale numeric features using the fitted scaler
             # test_scale uses parameters from train_scale — no data leakage
             x_scaled = scaler.test_scale(x_cont)  # [B, T, F_cont]
 
@@ -386,7 +415,7 @@ def main():
 
         with torch.no_grad():
             for batch in val_loader:
-                x_cont = batch["x_continuous"]
+                x_cont = batch["x_numeric"]
                 x_cat  = batch["x_categorical"]
                 x_fix  = batch["x_future_fixtures"]
                 y      = batch["y"]

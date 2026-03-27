@@ -5,8 +5,10 @@ import math
 
 import numpy as np
 import pandas as pd
+from sympy.core import Float
 import torch
 from torch.utils.data import Dataset
+import math 
 
 from .features import Features, FeatureSpec, FeatureType, DataSource
 from .ingester import Ingester, FPLSourceConfig, FixtureSourceConfig
@@ -97,12 +99,20 @@ class SeasonSequencer:
         # first gameweek a player plays minutes > 0, until then we use ingest_range
         self._first_gw: dict[str, str] = {}
         
+        # players removed for having no price — restored before each ingestion
+        # maps player_team_id → original meta row so we can restore them
+        self._priceless_players: dict[str, dict[str, int]] = {}
+
         # cache data in as dict, so lookup cheaper than pandas .loc
         self.player_cache: dict[int, dict[str, dict[str, float]]] = {}
 
         # cache fixture info for whole season, gw=0 is padded index for priors, all entries but team_code are 0
         self.fixture_cache: dict[int, dict[int, dict[str, int]]] = {0: self._build_prior_fixtures()} 
         self._init_fixture_cache()
+
+        # cache minutes lookup
+        self._minutes_lookup_cache: dict[int, dict[float, float]] = {}
+        self._build_minutes_lookup_cache
 
     #================================================
     # Initialise Helpers
@@ -127,6 +137,34 @@ class SeasonSequencer:
             self.fixture_cache[gw] = self._ingester.fixtures[gw].to_dict(orient="index")
     
         return self
+
+    @property
+    def _build_minutes_lookup_cache(self) -> "SeasonSequencer":
+        """Populate cache for minutes lookup, from deterministic model."""
+        # NOTE: at this stage this model is very crude...
+
+        # list in dicts give [k, x_0], for exponential activation function
+        position_params = {
+            1: [14.0, 5.0],
+            2: [2.5, 5.5],
+            3: [1.2, 7.5],
+            4: [1.3, 6.5],
+        }
+        for pos, params in position_params.items():
+            minutes_per_price = {}
+            for price in range(30, 170, 1):
+                price_flt = (float(price) / 10)
+                minutes_per_price[price_flt] = self._calc_minutes(params, price_flt)
+            
+            self._minutes_lookup_cache[pos] = minutes_per_price
+
+        return self
+
+    @staticmethod          
+    def _calc_minutes(params: list[float], price: float) -> float:
+        """Calculate a point on activation curve, defined by params"""
+        x  = (-1 * params[0]) * (price - params[1])
+        return 90 / (1 + math.exp(x))
 
     #================================================
     # PyTorch Helpers
@@ -178,6 +216,9 @@ class SeasonSequencer:
         Returns:
             Self, for method chaining.
         """
+        # restore any previously removed priceless players so the ingester sees them
+        self._restore_priceless_players()
+
         # reset ingester to ensure clean cumulative states
         self._ingester.reset()
 
@@ -190,6 +231,9 @@ class SeasonSequencer:
         # add new data to gw_cache
         for gw in range(gw_start, gw_end+1):
             self._cache_gw(gw)
+
+        # backfill zero prices for mid-season arrivals before priors see the data
+        self._backfill_zero_prices()
 
         if self._prior_data is None:
             self._prior_data = PriorData.from_data(
@@ -229,6 +273,9 @@ class SeasonSequencer:
         if self._prior_data is None:
             raise RuntimeError("Please provide priors or ingest_range() to step()")
 
+        # restore priceless players so the ingester picks them up
+        self._restore_priceless_players()
+
         self._current_gameweek += 1
 
         self._ingester.append_gw(self._current_gameweek)
@@ -237,6 +284,8 @@ class SeasonSequencer:
 
         self._cache_gw(self._current_gameweek)
 
+        # backfill or re-remove priceless players
+        self._backfill_zero_prices()
 
         return self
 
@@ -256,7 +305,7 @@ class SeasonSequencer:
         Construct a fixed-length sequence of gameweek rows for a single player.
 
         Builds one unified row per timestep containing all features, then splits
-        into continuous and categorical arrays using Features index masks.
+        into numeric and categorical arrays using Features index masks.
 
         For each timestep, selects either real data or a prior row depending on
         whether the player had appeared in the data by that gameweek.
@@ -267,8 +316,8 @@ class SeasonSequencer:
             inference: Whether the sequence is being built for inference.
 
         Returns:
-            Tuple of (continuous, categorical) arrays with shapes
-            [window_size, n_continuous] and [window_size, n_categorical].
+            Tuple of (numeric, categorical) arrays with shapes
+            [window_size, n_numeric] and [window_size, n_categorical].
         """
         # guard against, target_gw being out of ingested data range
         if target_gw <= 0 or (target_gw + self._target_window_size) > 38:
@@ -280,21 +329,16 @@ class SeasonSequencer:
         # static categorical codes, constant across timesteps
         position = self._player_meta[player_team_id]["position"]
         team_code = self._player_meta[player_team_id]["team_code"]
-        position_idx = self._player_meta[player_team_id]["position"]
         first_gw = self._first_gw[player_team_id]
 
-        # gw_window is a list of gw numbers, for whoms data we fetch. padded with 0s for prior rows
-        gw_window, n_pad = self._build_window(target_gw, first_gw)
-
-        # pre-allocate prior row, to search lookup for multiple weeks
-        prior_row = self._build_prior_row(n_pad, player_team_id, team_code, position)
+        # gw_window is a list tuples[gw_number, is_prior]
+        gw_window = self._build_window(target_gw, first_gw)
 
         # input_data: input for model, players stats for each feature, over window gws
         input_data = self._build_input_window(
                 player_team_id,
                 team_code,
-                position_idx,
-                prior_row,
+                position,
                 gw_window,
         )
         # given as a context vector to mlp
@@ -310,10 +354,10 @@ class SeasonSequencer:
             inference,
         )
 
-        # split unified array into continuous and categorical using index masks
+        # split unified array into numeric and categorical using index masks
         full = np.array(input_data, dtype=np.float32)
 
-        x_continuous = full[:, self.features.continuous_indices].astype(np.float32).round(3)
+        x_numeric = full[:, self.features.numeric_indices].astype(np.float32).round(3)
         x_categorical = full[:, self.features.categorical_indices].astype(np.int64)
         x_future_fixtures = np.array(future_fixtures, dtype=np.int64)
 
@@ -321,7 +365,7 @@ class SeasonSequencer:
 
         return {
             "player_team_id": player_team_id,
-            "x_continuous": x_continuous, 
+            "x_numeric": x_numeric, 
             "x_categorical": x_categorical, 
             "x_future_fixtures": x_future_fixtures,
             "input_window_length": self._window_size,
@@ -341,39 +385,134 @@ class SeasonSequencer:
 
         return self
 
-    def _build_window(self, target_gw: int, first_gw: int) -> tuple[list[int], int]:
+    def _restore_priceless_players(self) -> "SeasonSequencer":
+        """Re-add previously removed priceless players to metadata before ingestion."""
+        if not self._priceless_players:
+            return self
+
+        for player_id, meta_row in self._priceless_players.items():
+            self._player_meta[player_id] = meta_row
+
+        self.player_meta = pd.DataFrame.from_dict(
+            self._player_meta, orient="index",
+        )
+        self.player_meta.index.name = "player_team_id"
+
+        logger.info(
+            "Restored %d priceless player(s) for re-evaluation: %s",
+            len(self._priceless_players),
+            list(self._priceless_players.keys()),
+        )
+
+        self._priceless_players.clear()
+
+        return self
+
+    def _backfill_zero_prices(self) -> "SeasonSequencer":
+        """
+        Forward-fill zero prices for players who join the league mid-season.
+
+        Scans all cached gameweeks to find each zero-priced player's first
+        non-zero price and writes it back into earlier gameweeks. Players
+        with no price across the entire cached range are removed from
+        metadata and marked as priceless for future restoration.
+
+        Returns:
+            Self, for method chaining.
+        """
+        gw_range = sorted(self.player_cache.keys())
+        first_gw = gw_range[0]
+        first_gw_cache = self.player_cache[first_gw]
+
+        # only players with zero price in the first cached GW need attention
+        zero_price_players = [
+            pid for pid, stats in first_gw_cache.items()
+            if stats["price"] <= 0.0 and pid in self._player_meta
+        ]
+
+        to_remove: list[str] = []
+
+        for player_id in zero_price_players:
+            # forward-search for first non-zero price (skip first GW)
+            first_price = 0.0
+            first_price_gw = None
+            for gw in gw_range[1:]:
+                price = self.player_cache[gw][player_id]["price"]
+                if price > 0.0:
+                    first_price = price
+                    first_price_gw = gw
+                    break
+
+            if first_price_gw is None:
+                to_remove.append(player_id)
+                continue
+
+            # backfill earlier gameweeks with the first known price
+            for gw in gw_range:
+                if gw >= first_price_gw:
+                    break
+                self.player_cache[gw][player_id]["price"] = first_price
+                self._ingester.player_gw_stats[gw].loc[
+                    player_id, "price"
+                ] = first_price
+
+        # remove players that have no price in the entire cached range
+        for player_id in to_remove:
+            self._remove_player(player_id)
+
+        if to_remove:
+            logger.info(
+                "Removed %d priceless player(s): %s",
+                len(to_remove), to_remove,
+            )
+
+        return self
+
+    def _remove_player(self, player_id: str) -> None:
+        """Remove a player from metadata and mark as priceless for future restoration."""
+        meta_row = self._player_meta.pop(player_id, None)
+        if meta_row is not None:
+            self._priceless_players[player_id] = meta_row
+
+        self.player_meta = self.player_meta.drop(
+            index=player_id, errors="ignore",
+        )
+        self._first_gw.pop(player_id, None)
+
+    def _build_window(self, target_gw: int, first_gw: int) -> list[tuple[int, int]]:
         """Build the list of gameweeks in the sliding window ending before target_gw."""
-        # window must always start at seq_start > 0
-        seq_start = max(1, target_gw - self._window_size)
+        # pre season window entries take form (1, 1),
+        # gw 1 provides price and transfers before season starts
+        if (target_gw - self._window_size) < 1:
+            window = list(range(1, target_gw))
+            n_pad = self._window_size - len(window) 
 
-        window = list(range(seq_start, target_gw))
-
-        # filter any gameweeks before the player's first appearance
-        # if player hasn't appeared yet first_gw = 39 so gw_window = []
-        gw_window = [i for i in window if i >= first_gw]
-
-        # pad to window_size with 0s (prior rows) at the front
-        n_pad = self._window_size - len(gw_window)
-        gw_window[:0] = [0] * n_pad
-
-        return gw_window, n_pad
-
-    def _build_prior_row(self, n_pad: int, player_team_id: str, team_code: int, position: int) -> list[float | int]:
-        """Pre-fetch prior row if any padding needed"""
-        if n_pad != 0:
-            prior_row = self._get_prior(player_team_id, str(team_code), str(position))
-            prior_row.update(self.fixture_cache[0][team_code])
+            # ensure window and prior window have length self._window_size
+            is_prior_window = [1] * n_pad + [0 if i >= first_gw else 1 for i in window]
+            window = [1] * n_pad + window
         else:
-            prior_row = None
+            seq_start = (target_gw - self._window_size) 
 
-        return prior_row
+            window = list(range(seq_start, target_gw))
+            is_prior_window = [0 if i >= first_gw else 1 for i in window ]
 
-    def _get_prior(self, player_team_id: str, team_code: str, position: str) -> dict[str, float]:
+        # gw_window is list of tuples[gw_number, is_prior]
+        gw_window = zip(window, is_prior_window, strict=True)
+
+        return gw_window
+
+    def _get_prior(
+        self, 
+        gw: int,
+        player_team_id: str, 
+        team_code: int, 
+        position: int,
+    ) -> dict[str, float]:
         """Look up the best available prior for a player, falling back through the hierarchy."""
         if self._prior_data is None:
             raise RuntimeError("No prior data available, call ingest_range() first.")
 
-        pos_team = "_".join([position, team_code])       # NOTE: order is convention
+        pos_team = "_".join([str(position), str(team_code)])       # NOTE: order is convention
 
         # lookup player in prior hierarchy
         # load dict as shallow copy, so we dont mutate
@@ -391,12 +530,22 @@ class SeasonSequencer:
 
         # add row to denote prior, "data_age" is sentinel to be populated later
         prior_row["is_prior"], prior_row["data_age"] = 1, 0.0
+
+        
+        # some up to date data for the player is available, transfers, price, ect.
+        current_data = self.player_cache[gw][player_team_id]
+        prior_row.update({
+            "price": current_data["price"],
+            "transfers_in": current_data["transfers_in"],
+            "transfers_out": current_data["transfers_out"],
+            "minutes": self._minutes_lookup(position, current_data["price"])
+        })
         return prior_row
 
-    @staticmethod
-    def _minutes_lookup(prior_row: dict[str, float]) -> float:
-        """Return a scaled minutes estimate for a player with no recorded data; currently a stub returning 0.0."""
-        return 0.0
+    def _minutes_lookup(self, position: int, value: float) -> float:
+        """Return a scaled minutes estimate (from minutes cache) for a player with no recorded data."""
+
+        return self._minutes_lookup_cache[position][round(value, 1)]
         
     def _get_real_row(self, player_team_code: str, gw: int) -> dict[str, float]:
         """Retrieve a player's cached stats for a given gameweek."""
@@ -411,24 +560,26 @@ class SeasonSequencer:
         self, 
         player_team_id: str, 
         team_code: int, 
-        position_idx: int, 
-        prior_row: list[float], 
-        gw_window: list[int]
+        position: int,  
+        gw_window: list[tuple[int, int]],
     ) -> list[float]:
         """Builds window of input (to model) features"""
         output_columns = self.features.output_columns
         unified_rows = []
 
-        for i, gw in enumerate(gw_window):
-            if gw == 0:
+
+        for i, (gw, is_prior) in enumerate(gw_window):
+            if is_prior == 0:
+                prior_row = self._get_prior(gw, player_team_id, team_code, position)
                 prior_row["data_age"] = self._window_size - i
-                row = dict(prior_row)
+                row = prior_row
+                row.update(self.fixture_cache[0][team_code])
             else:
                 row = self._get_real_row(player_team_id, gw)
                 row.update(self.fixture_cache[gw][team_code])
 
             # categorical codes from player meta and fixture data
-            row["position"] = position_idx
+            row["position"] = position
             row["team_code"] = team_code
 
             unified_rows.append([row[col] for col in output_columns])
@@ -537,7 +688,7 @@ class FPLDataset(Dataset):
 
         Returns:
             Dictionary with keys:
-                x_continuous: float32 tensor, shape [T, F_cont].
+                x_numeric: float32 tensor, shape [T, F_cont].
                 x_categorical: long tensor, shape [T, C].
                 x_future_fixtures: long tensor, shape [K, fix_features].
                 y: float32 tensor, shape [target_window_size].
@@ -551,8 +702,8 @@ class FPLDataset(Dataset):
             )
         
         return {
-            "x_continuous": torch.tensor(
-                sample["x_continuous"], dtype=torch.float32,
+            "x_numeric": torch.tensor(
+                sample["x_numeric"], dtype=torch.float32,
             ),
             "x_categorical": torch.tensor(
                 sample["x_categorical"], dtype=torch.long,

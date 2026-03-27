@@ -343,7 +343,7 @@ def main():
 
     # ─── Check for negative transfers ───
 
-    cont_names = features25.temporal_columns
+    cont_names = features25.numeric_columns
     flat_check = x_cont.reshape(-1, x_cont.shape[-1])
 
     for col_name in ("transfers_in", "transfers_out"):

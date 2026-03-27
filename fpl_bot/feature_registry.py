@@ -118,10 +118,13 @@ def _build_common_specs(
         name="minutes",
 
         feature_type=FeatureType.BIMODAL,
-        scaling_mode=ScalingMode.ROBUST,
+        scaling_mode=ScalingMode.BOUNDED,
         accumulation=AccumulationType.RAW_CUMULATIVE,
         temporal=True,
         source={DataSource.VAASTAV: "minutes", DataSource.FCI: "minutes", DataSource.OPTA: "minutes_played"},
+        presence_check=True,
+        min_value=0,
+        max_value=90.0,
     ),
     FeatureSpec(
         name="starts",
@@ -717,8 +720,6 @@ def _build_common_specs(
         accumulation=AccumulationType.NONE,
         temporal=True,
         source={DataSource.FIXTURE: "team_elo"},
-        presence_check=True,
-        min_value=0.0,
     ),
     FeatureSpec(
         name="oppo_team_elo",
@@ -728,8 +729,6 @@ def _build_common_specs(
         accumulation=AccumulationType.NONE,
         temporal=True,
         source={DataSource.FIXTURE: "oppo_team_elo"},
-        presence_check=True,
-        min_value=0.0,
     ),
     FeatureSpec(
         name="is_home",
@@ -739,8 +738,6 @@ def _build_common_specs(
         accumulation=AccumulationType.NONE,
         temporal=True,
         source={DataSource.FIXTURE: "is_home"},
-        presence_check=True,
-        min_value=-1,
     ),
 
     # num_matches — number of matches a team played in the GW (1 normal,
