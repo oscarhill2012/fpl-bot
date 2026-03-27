@@ -177,7 +177,7 @@ def _build_common_specs(
         name="transfers_in",
 
         feature_type=FeatureType.SKEWED_POSITIVE,
-        scaling_mode=ScalingMode.LOG,
+        scaling_mode=ScalingMode.LOG_ROBUST,
         accumulation=AccumulationType.NONE,
         temporal=True,
         source={DataSource.VAASTAV: "transfers_in", DataSource.FCI: "transfers_in"},
@@ -186,7 +186,7 @@ def _build_common_specs(
         name="transfers_out",
 
         feature_type=FeatureType.SKEWED_POSITIVE,
-        scaling_mode=ScalingMode.LOG,
+        scaling_mode=ScalingMode.LOG_ROBUST,
         accumulation=AccumulationType.NONE,
         temporal=True,
         source={DataSource.VAASTAV: "transfers_out", DataSource.FCI: "transfers_out"},

@@ -379,7 +379,9 @@ def main():
     fig.suptitle("Numeric Feature Distributions", fontsize=12)
     fig.tight_layout(pad=2.0, w_pad=1.5, h_pad=2.0)
     plt.show()
-
+    plot_save = _PROJECT_ROOT / "Plots"  
+    fig.savefig(plot_save / "first_attempt_scaled_data25-26.jpeg")
+    
 """    # ─── 5. Training loop ───
 
     model = ...       # your LSTM + MLP model

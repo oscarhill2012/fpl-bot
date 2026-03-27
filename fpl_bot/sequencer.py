@@ -233,7 +233,7 @@ class SeasonSequencer:
             self._cache_gw(gw)
 
         # backfill zero prices for mid-season arrivals before priors see the data
-        self._backfill_zero_prices()
+        self._backfill_zero_prices(gw_start, gw_end)
 
         if self._prior_data is None:
             self._prior_data = PriorData.from_data(
@@ -285,9 +285,107 @@ class SeasonSequencer:
         self._cache_gw(self._current_gameweek)
 
         # backfill or re-remove priceless players
-        self._backfill_zero_prices()
+        self._backfill_zero_prices(self._current_gameweek, self._current_gameweek)
 
         return self
+
+    #================================================
+    # Ingestion and State Management
+    # Private Helpers
+    #================================================ 
+    #    
+    def _cache_gw(self, gw: int) -> "SeasonSequencer":
+        """Convert the ingested DataFrame for a gameweek to a nested dict for fast lookup."""
+        self.player_cache[gw] = self._ingester.player_gw_stats[gw].to_dict(orient="index")
+
+        return self
+
+    def _restore_priceless_players(self) -> "SeasonSequencer":
+        """Re-add previously removed priceless players to metadata before ingestion."""
+        if not self._priceless_players:
+            return self
+
+        for player_team_id, meta_row in self._priceless_players.items():
+            self._player_meta[player_team_id] = meta_row
+
+        self.player_meta = pd.DataFrame.from_dict(
+            self._player_meta, orient="index",
+        )
+        self.player_meta.index.name = "player_team_id"
+
+        logger.info(
+            "Restored %d priceless player(s) for re-evaluation: %s",
+            len(self._priceless_players),
+            list(self._priceless_players.keys()),
+        )
+
+        self._priceless_players.clear()
+
+        return self
+
+    def _backfill_zero_prices(self, gw_start: int, gw_end: int) -> "SeasonSequencer":
+        """
+        Forward-fill zero prices for players who join the league mid-season.
+
+        Scans all cached players to find any with 0.0 price in first gw,
+        any player with missing price must start with missing price. Players
+        with no price across the entire cached range are removed from
+        metadata and marked as priceless for future restoration.
+
+        Returns:
+            Self, for method chaining.
+        """
+
+        last_known_price = {}
+        to_remove = set()
+
+        # iterate backwards
+        for gw in range(gw_end, gw_start - 1, -1):
+            gw_data = self.player_cache[gw]
+
+            for pid, stats in gw_data.items():
+                if pid not in self._player_meta:
+                    continue
+
+                price = stats["price"]
+
+                if price > 0.0:
+                    last_known_price[pid] = price
+                else:
+                    if pid in last_known_price:
+                        # fill with known future price
+                        filled_price = last_known_price[pid]
+                        stats["price"] = filled_price
+
+                        self._ingester.player_gw_stats[gw].loc[
+                            pid, "price"
+                        ] = filled_price
+                    else:
+                        # no future price exists
+                        to_remove.add(pid)
+
+        # remove players that have no price in the entire cached range
+        for player_team_id in to_remove:
+            self._remove_player(player_team_id)
+
+        if to_remove:
+            logger.info(
+                "Removed %d priceless player(s): %s",
+                len(to_remove), to_remove,
+            )
+
+        return self
+
+    def _remove_player(self, player_team_id: str) -> None:
+        """Remove a player from metadata and mark as priceless for future restoration."""
+        meta_row = self._player_meta.pop(player_team_id, None)
+        if meta_row is not None:
+            self._priceless_players[player_team_id] = meta_row
+
+        self.player_meta = self.player_meta.drop(
+            index=player_team_id, errors="ignore",
+        )
+        self._first_gw.pop(player_team_id, None)
 
     #================================================
     # Sequence Construction
@@ -376,108 +474,9 @@ class SeasonSequencer:
         }
 
     #================================================
+    # Sequence Construction
     # Private Helpers
     #================================================
-
-    def _cache_gw(self, gw: int) -> "SeasonSequencer":
-        """Convert the ingested DataFrame for a gameweek to a nested dict for fast lookup."""
-        self.player_cache[gw] = self._ingester.player_gw_stats[gw].to_dict(orient="index")
-
-        return self
-
-    def _restore_priceless_players(self) -> "SeasonSequencer":
-        """Re-add previously removed priceless players to metadata before ingestion."""
-        if not self._priceless_players:
-            return self
-
-        for player_id, meta_row in self._priceless_players.items():
-            self._player_meta[player_id] = meta_row
-
-        self.player_meta = pd.DataFrame.from_dict(
-            self._player_meta, orient="index",
-        )
-        self.player_meta.index.name = "player_team_id"
-
-        logger.info(
-            "Restored %d priceless player(s) for re-evaluation: %s",
-            len(self._priceless_players),
-            list(self._priceless_players.keys()),
-        )
-
-        self._priceless_players.clear()
-
-        return self
-
-    def _backfill_zero_prices(self) -> "SeasonSequencer":
-        """
-        Forward-fill zero prices for players who join the league mid-season.
-
-        Scans all cached gameweeks to find each zero-priced player's first
-        non-zero price and writes it back into earlier gameweeks. Players
-        with no price across the entire cached range are removed from
-        metadata and marked as priceless for future restoration.
-
-        Returns:
-            Self, for method chaining.
-        """
-        gw_range = sorted(self.player_cache.keys())
-        first_gw = gw_range[0]
-        first_gw_cache = self.player_cache[first_gw]
-
-        # only players with zero price in the first cached GW need attention
-        zero_price_players = [
-            pid for pid, stats in first_gw_cache.items()
-            if stats["price"] <= 0.0 and pid in self._player_meta
-        ]
-
-        to_remove: list[str] = []
-
-        for player_id in zero_price_players:
-            # forward-search for first non-zero price (skip first GW)
-            first_price = 0.0
-            first_price_gw = None
-            for gw in gw_range[1:]:
-                price = self.player_cache[gw][player_id]["price"]
-                if price > 0.0:
-                    first_price = price
-                    first_price_gw = gw
-                    break
-
-            if first_price_gw is None:
-                to_remove.append(player_id)
-                continue
-
-            # backfill earlier gameweeks with the first known price
-            for gw in gw_range:
-                if gw >= first_price_gw:
-                    break
-                self.player_cache[gw][player_id]["price"] = first_price
-                self._ingester.player_gw_stats[gw].loc[
-                    player_id, "price"
-                ] = first_price
-
-        # remove players that have no price in the entire cached range
-        for player_id in to_remove:
-            self._remove_player(player_id)
-
-        if to_remove:
-            logger.info(
-                "Removed %d priceless player(s): %s",
-                len(to_remove), to_remove,
-            )
-
-        return self
-
-    def _remove_player(self, player_id: str) -> None:
-        """Remove a player from metadata and mark as priceless for future restoration."""
-        meta_row = self._player_meta.pop(player_id, None)
-        if meta_row is not None:
-            self._priceless_players[player_id] = meta_row
-
-        self.player_meta = self.player_meta.drop(
-            index=player_id, errors="ignore",
-        )
-        self._first_gw.pop(player_id, None)
 
     def _build_window(self, target_gw: int, first_gw: int) -> list[tuple[int, int]]:
         """Build the list of gameweeks in the sliding window ending before target_gw."""
@@ -500,6 +499,35 @@ class SeasonSequencer:
         gw_window = zip(window, is_prior_window, strict=True)
 
         return gw_window
+
+    def _build_input_window(
+        self, 
+        player_team_id: str, 
+        team_code: int, 
+        position: int,  
+        gw_window: list[tuple[int, int]],
+    ) -> list[float]:
+        """Builds window of input (to model) features"""
+        output_columns = self.features.output_columns
+        unified_rows = []
+
+        for i, (gw, is_prior) in enumerate(gw_window):
+            if is_prior == 1:
+                prior_row = self._get_prior(gw, player_team_id, team_code, position)
+                prior_row["data_age"] = self._window_size - i
+                row = prior_row
+                row.update(self.fixture_cache[0][team_code])
+            else:
+                row = self._get_real_row(player_team_id, gw)
+                row.update(self.fixture_cache[gw][team_code])
+
+            # categorical codes from player meta and fixture data
+            row["position"] = position
+            row["team_code"] = team_code
+
+            unified_rows.append([row[col] for col in output_columns])
+
+        return unified_rows
 
     def _get_prior(
         self, 
@@ -531,9 +559,11 @@ class SeasonSequencer:
         # add row to denote prior, "data_age" is sentinel to be populated later
         prior_row["is_prior"], prior_row["data_age"] = 1, 0.0
 
-        
         # some up to date data for the player is available, transfers, price, ect.
         current_data = self.player_cache[gw][player_team_id]
+
+        if current_data["price"] == 0:
+            print(gw)
         prior_row.update({
             "price": current_data["price"],
             "transfers_in": current_data["transfers_in"],
@@ -544,7 +574,7 @@ class SeasonSequencer:
 
     def _minutes_lookup(self, position: int, value: float) -> float:
         """Return a scaled minutes estimate (from minutes cache) for a player with no recorded data."""
-
+        
         return self._minutes_lookup_cache[position][round(value, 1)]
         
     def _get_real_row(self, player_team_code: str, gw: int) -> dict[str, float]:
@@ -555,36 +585,6 @@ class SeasonSequencer:
         # add row to denote prior, "data_age" is sentinel
         real_row["is_prior"], real_row["data_age"] = 0, 0.0
         return real_row
-
-    def _build_input_window(
-        self, 
-        player_team_id: str, 
-        team_code: int, 
-        position: int,  
-        gw_window: list[tuple[int, int]],
-    ) -> list[float]:
-        """Builds window of input (to model) features"""
-        output_columns = self.features.output_columns
-        unified_rows = []
-
-
-        for i, (gw, is_prior) in enumerate(gw_window):
-            if is_prior == 0:
-                prior_row = self._get_prior(gw, player_team_id, team_code, position)
-                prior_row["data_age"] = self._window_size - i
-                row = prior_row
-                row.update(self.fixture_cache[0][team_code])
-            else:
-                row = self._get_real_row(player_team_id, gw)
-                row.update(self.fixture_cache[gw][team_code])
-
-            # categorical codes from player meta and fixture data
-            row["position"] = position
-            row["team_code"] = team_code
-
-            unified_rows.append([row[col] for col in output_columns])
-
-        return unified_rows
 
     def _build_future_fixtures_window(self, team_code: int, target_gw: int) -> list[int]:
         """Builds a window of a teams future fixtures."""
@@ -609,7 +609,7 @@ class SeasonSequencer:
                 target_data.append(0.0)
 
         return target_data
-
+        
 
 class FPLDataset(Dataset):
 
@@ -660,9 +660,9 @@ class FPLDataset(Dataset):
         # --- build flat sample index ---
         # Order: all players for GW1, then all for GW2, etc.
         self._sample_index: list[tuple[str, int]] = [
-            (player_id, gw)
+            (player_team_id, gw)
             for gw in range(gw_start, gw_end + 1)
-            for player_id in players
+            for player_team_id in players
         ]
 
         logger.info(
