@@ -40,6 +40,9 @@ class AccumulationType(Enum):
     PER_90 = "per_90"       # accumulative and then divided by cum_minutes / 90
     RAW_CUMULATIVE = "raw"  # accumulated but NOT divided by minutes
 
+class PositionGroup(Enum):
+    GK = 1      # goalkeepers only (position_id == 1)
+
 class DataSource(Enum):
     # external — loaded from CSV files
     VAASTAV = "vaastav"
@@ -84,6 +87,7 @@ class FeatureSpec:
         max_value: float | None = None,
         min_value: float = 0,
         scaling_params: list | None = None,
+        position_group: PositionGroup | None = None,
     ):
         """
         Initialise a FeatureSpec.
@@ -107,6 +111,8 @@ class FeatureSpec:
             max_value: Maximum value for bounded scaling.
             min_value: Minimum value for bounded scaling or presence check threshold.
             scaling_params: Fitted scaling parameters [p1, p2]; populated after scaling.
+            position_group: If set, the scaler fits only on rows from this
+                position group. Transform still applies to all rows.
         """
         self.name = name
         self.feature_type = feature_type
@@ -120,6 +126,7 @@ class FeatureSpec:
         self.min_value = min_value
         self.period = period
 
+        self.position_group = position_group
         self.source = source if source is not None else {}
 
         # avoid mutable defaults
@@ -598,9 +605,15 @@ class Features:
         return self.specs[index].name
         
     @property
-    def specs_by_mode(self) -> dict[ScalingMode, list[FeatureSpec]]:
-        """Group specs by their scaling mode."""
-        return {mode: [s for s in self.specs if s.scaling_mode == mode] for mode in ScalingMode}
+    def specs_by_mode(
+        self,
+    ) -> dict[tuple[ScalingMode, PositionGroup | None], list[FeatureSpec]]:
+        """Group specs by (scaling_mode, position_group) tuple."""
+        result: dict[tuple[ScalingMode, PositionGroup | None], list[FeatureSpec]] = {}
+        for s in self.specs:
+            key = (s.scaling_mode, s.position_group)
+            result.setdefault(key, []).append(s)
+        return result
 
     @property
     def specs_by_provider(self) -> dict[DataSource, list[FeatureSpec]]:
@@ -668,6 +681,7 @@ class Features:
                 "period": s.period,
                 "max_value": s.max_value,
                 "min_value": s.min_value,
+                "position_group": s.position_group.value if s.position_group else None,
             }
             for s in self.specs
         ]
@@ -704,6 +718,9 @@ class Features:
                 ds_value = "sequencer" if provider_str == "seq" else provider_str
                 source[DataSource(ds_value)] = d["name"]
 
+            raw_pos_group = d.get("position_group")
+            pos_group = PositionGroup(raw_pos_group) if raw_pos_group is not None else None
+
             specs.append(
                 FeatureSpec(
                     name=d["name"],
@@ -719,6 +736,7 @@ class Features:
                     period=d["period"],
                     max_value=d["max_value"],
                     min_value=d["min_value"],
+                    position_group=pos_group,
                 )
             )
         return cls(specs)
@@ -736,18 +754,32 @@ class Features:
         """
         return torch.tensor([s.temporal for s in self.specs])
 
-    def build_scaling_masks(self) -> dict[ScalingMode, torch.Tensor]:
+    def build_scaling_masks(
+        self,
+    ) -> dict[tuple[ScalingMode, PositionGroup | None], torch.Tensor]:
         """
-        Builds boolean masks for each scaling mode.
-        
+        Build boolean masks keyed by (ScalingMode, PositionGroup | None).
+
+        Features sharing the same scaling mode but different position groups
+        get separate mask entries so the scaler can fit them independently.
+
         Returns:
-            Scaling masks for each scaling mode; dict[ScalingMode, Tensor]
+            Dict mapping (mode, position_group) to a boolean tensor of
+            length len(self.specs).
         """
+        keys = {
+            (s.scaling_mode, s.position_group)
+            for s in self.specs
+            if s.scaling_mode != ScalingMode.IDENTITY
+        }
         masks = {}
-        for mode in ScalingMode:
-            masks[mode] = torch.tensor(
-                [s.scaling_mode == mode for s in self.specs],
-                dtype=torch.bool
+        for mode, pos_group in keys:
+            masks[(mode, pos_group)] = torch.tensor(
+                [
+                    s.scaling_mode == mode and s.position_group == pos_group
+                    for s in self.specs
+                ],
+                dtype=torch.bool,
             )
         return masks
 

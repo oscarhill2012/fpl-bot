@@ -5,7 +5,7 @@ import warnings
 
 import torch
 
-from .features import Features, ScalingMode, FeatureSpec
+from .features import Features, ScalingMode, PositionGroup, FeatureSpec
 
 logger = logging.getLogger(__name__)
 
@@ -548,33 +548,34 @@ class FeatureScaler:
         self.eps = eps
         self.device = device
 
-        # generates scaling and presence masks 
+        # generates scaling and presence masks
+        # keyed by (ScalingMode, PositionGroup | None)
         self.scaling_masks = features.build_scaling_masks()
         self._build_presence_indices()
 
-        # specs gives dict{ScalingMode: list of feature names for that mode}
+        # specs grouped by (ScalingMode, PositionGroup | None)
         self.specs_by_mode = self.features.specs_by_mode
-
-        # bound tensor is collection of min and max for bound scaling
-        self._build_bound_tensor()
 
         # _fitted now refers to the collection of scalers generated upon init
         self._fitted = False
 
-        # n_scaled is how many features each scaling mode acts on
+        # n_scaled is how many features each (mode, pos_group) acts on
         self.n_scaled = {}
-        # dict of scaler instances
+        # dict of scaler instances keyed by (mode, pos_group)
         self._scalers = {}
 
-        for mode, cls in _MODE_TO_SCALER.items():
-            self.n_scaled[mode] = self.scaling_masks[mode].sum().item()
-            # initialise scaler instances
-            if self.scaling_masks[mode].any().item():
-                self._scalers[mode] = cls(
+        for (mode, pos_group), mask in self.scaling_masks.items():
+            if mode not in _MODE_TO_SCALER:
+                continue
+            n = mask.sum().item()
+            self.n_scaled[(mode, pos_group)] = n
+            if n > 0:
+                bound_min, bound_max = self._bound_values_for(mode, pos_group)
+                self._scalers[(mode, pos_group)] = _MODE_TO_SCALER[mode](
                     device=self.device,
                     eps=self.eps,
-                    min_value=self.min_vals,
-                    max_value=self.max_vals,
+                    min_value=bound_min,
+                    max_value=bound_max,
                 )
 
     #================================================
@@ -595,68 +596,86 @@ class FeatureScaler:
         if not torch.isfinite(x).all().item():
             raise ValueError('Input tensor contains NaN or infinite value(s).')
 
-    def _build_bound_tensor(self):
-        """Collect min and max values from bounded specs into tensors for _BoundedScaler."""
-        min_vals = []
-        max_vals = []
+    def _bound_values_for(
+        self,
+        mode: ScalingMode,
+        pos_group: PositionGroup | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Collect min/max tensors for bounded specs in the given group."""
+        if mode != ScalingMode.BOUNDED:
+            return None, None
 
-        for feature in self.features.specs:
-            if feature.scaling_mode == ScalingMode.BOUNDED:
-                max_vals.append(feature.max_value)
-                min_vals.append(feature.min_value)
+        specs = [
+            s for s in self.features.specs
+            if s.scaling_mode == ScalingMode.BOUNDED
+            and s.position_group == pos_group
+        ]
+        if not specs:
+            return None, None
 
-        # None makes bound scaler set to 0s
-        if not max_vals:
-            self.max_vals = None
-            self.min_vals = None
-            return self
-
-        # _BoundedScaler requires tensor input [1, n_scaled_features], even if None
-        self.max_vals = torch.tensor(max_vals, dtype=torch.float32).unsqueeze(0)
-        self.min_vals = torch.tensor(min_vals, dtype=torch.float32).unsqueeze(0)
-        return self
+        min_vals = torch.tensor(
+            [s.min_value for s in specs], dtype=torch.float32,
+        ).unsqueeze(0)
+        max_vals = torch.tensor(
+            [s.max_value for s in specs], dtype=torch.float32,
+        ).unsqueeze(0)
+        return min_vals, max_vals
 
     #================================================
     # Public Functions
     #================================================
 
-    def train_scale(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    def train_scale(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
         """
         Fit all scalers on the training data and return the scaled tensor.
 
-        Fitting parameters are stored inside each FeatureSpec's scaling_params field.
-        Absent rows (determined by presence mask) are excluded from fitting.
+        Fitting parameters are stored inside each FeatureSpec's scaling_params
+        field. Absent rows (determined by presence mask) are excluded from
+        fitting. Features with a position_group are fitted only on rows from
+        that position, but transformed across all present rows.
 
         Args:
             x: Input tensor of shape [players, gameweeks, features].
+            position_ids: Optional [players] integer tensor of position IDs
+                (1=GKP, 2=DEF, 3=MID, 4=FWD). Required when any feature has
+                a position_group set; ignored otherwise.
 
         Returns:
             Tuple of (scaled tensor, features dict with fitted scaling params).
         """
-        # validate
         self._validate_input(x)
-        # clone to avoid mutation
         x = x.clone()
-        # build presence mask now we have data
         presence_mask = self._build_presence_mask(x).to(self.device)
 
-        # scaler gets data after presence and scaling masks applied
-        # scaling mask is just which type of scaling is applied to which feature
         x_present = x[presence_mask]
-        for mode, scaler in self._scalers.items():
-            x_present[:, self.scaling_masks[mode]] = scaler.fit_transform(x_present[:, self.scaling_masks[mode]])
+        for (mode, pos_group), scaler in self._scalers.items():
+            feat_mask = self.scaling_masks[(mode, pos_group)]
+
+            if pos_group is not None and position_ids is not None:
+                # fit only on rows matching the position group
+                pos_row_mask = self._build_position_row_mask(
+                    presence_mask, position_ids, pos_group,
+                )
+                scaler.fit(x_present[pos_row_mask][:, feat_mask])
+            else:
+                scaler.fit(x_present[:, feat_mask])
+
+            # transform ALL present rows with the fitted params
+            x_present[:, feat_mask] = scaler.transform(
+                x_present[:, feat_mask],
+            )
 
             param1, param2 = scaler.params
-            self._append_params(mode, param1, param2)
+            self._append_params((mode, pos_group), param1, param2)
 
         # write back scaled values for present rows
         x[presence_mask] = x_present
 
-        # now fitted
         self._fitted = True
-
-        # return scaled tensor shape = [n_samples, n_timesteps, n_features], and return features dict, now with scaling params
-        # features dict must be given with x as this is the meta data for tensor
         return x, self.features.to_dict()
 
     def test_scale(self, x: torch.Tensor) -> torch.Tensor:
@@ -684,8 +703,9 @@ class FeatureScaler:
         presence_mask = self._build_presence_mask(x).to(self.device)
         x_present = x[presence_mask]
 
-        for mode, scaler in self._scalers.items():
-            x_present[:, self.scaling_masks[mode]] = scaler.transform(x_present[:, self.scaling_masks[mode]])
+        for key, scaler in self._scalers.items():
+            feat_mask = self.scaling_masks[key]
+            x_present[:, feat_mask] = scaler.transform(x_present[:, feat_mask])
 
         x[presence_mask] = x_present
         return x
@@ -711,17 +731,20 @@ class FeatureScaler:
         x_inv = x[presence_mask]
 
         # allow inverse to be called after fitting scalers, or with scaling parameters in feature dict
-        for mode, scaler in self._scalers.items():
+        for key, scaler in self._scalers.items():
+            feat_mask = self.scaling_masks[key]
             if self._fitted:
-                x_inv[:, self.scaling_masks[mode]] = scaler.inverse_transform(x_inv[:, self.scaling_masks[mode]])
+                x_inv[:, feat_mask] = scaler.inverse_transform(x_inv[:, feat_mask])
 
             else:
                 # transpose so shape is [n_params, n_features], for broadcasting convenience
                 params = torch.tensor(
-                    [s.scaling_params for s in self.specs_by_mode[mode]],
-                    dtype = torch.float32,
+                    [s.scaling_params for s in self.specs_by_mode[key]],
+                    dtype=torch.float32,
                 ).T
-                x_inv[:, self.scaling_masks[mode]] = scaler.fit_inverse_from_params(x_inv[:, self.scaling_masks[mode]], params)
+                x_inv[:, feat_mask] = scaler.fit_inverse_from_params(
+                    x_inv[:, feat_mask], params,
+                )
 
         x[presence_mask] = x_inv
         return x
@@ -765,9 +788,25 @@ class FeatureScaler:
         mask = (x_check > self._presence_min_values).all(dim=-1)
         return mask
 
-    def _append_params(self, mode: ScalingMode, param1: float, param2: float) -> "FeatureScaler":
-        """Adds params to features instance"""
-        for spec, p1, p2 in zip(self.specs_by_mode[mode], param1[0], param2[0], strict=True):
+    def _build_position_row_mask(
+        self,
+        presence_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        pos_group: PositionGroup,
+    ) -> torch.Tensor:
+        """Build a [N_present] boolean mask selecting present rows from a position group."""
+        pos_mask = (position_ids == pos_group.value).unsqueeze(1)
+        pos_expanded = pos_mask.expand_as(presence_mask)
+        return pos_expanded[presence_mask]
+
+    def _append_params(
+        self,
+        key: tuple[ScalingMode, PositionGroup | None],
+        param1: torch.Tensor,
+        param2: torch.Tensor,
+    ) -> "FeatureScaler":
+        """Store fitted scaling parameters back into each FeatureSpec."""
+        for spec, p1, p2 in zip(self.specs_by_mode[key], param1[0], param2[0], strict=True):
             spec.scaling_params = [p1.item(), p2.item()]
 
         return self

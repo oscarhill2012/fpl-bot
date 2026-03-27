@@ -334,21 +334,26 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)  
     val_loader   = DataLoader(val_ds, batch_size=64, shuffle=False)
  
-    # ─── 6. Fit the scaler on training data ─── 
-    # Collect all training x_numeric into one tensor for fitting. 
-    # This is a one-time operation before training starts.
- 
-    all_x_numeric = [] 
-    for batch in train_loader:
+    # ─── 6. Fit the scaler on training data ───
+    # Collect all training x_numeric and position IDs for fitting.
+    # Position IDs enable position-aware scaling for GK-specific features.
 
-        all_x_numeric.append(batch["x_numeric"])  
- 
-    # Stack into [N_total, T, F] — this IS the [P, G, F] convention 
-    all_x_numeric = torch.cat(all_x_numeric, dim=0)  
+    all_x_numeric = []
+    all_position_ids = []
+    for batch in train_loader:
+        all_x_numeric.append(batch["x_numeric"])
+        # position is first categorical, constant across timesteps
+        all_position_ids.append(batch["x_categorical"][:, 0, 0])
+
+    # Stack into [N_total, T, F] — this IS the [P, G, F] convention
+    all_x_numeric = torch.cat(all_x_numeric, dim=0)
+    position_ids = torch.cat(all_position_ids, dim=0)
 
     scaled_features = features25.filtered_numeric
     scaler = FeatureScaler(scaled_features)
-    scaled_train, features_dict = scaler.train_scale(all_x_numeric)
+    scaled_train, features_dict = scaler.train_scale(
+        all_x_numeric, position_ids=position_ids,
+    )
     # scaler is now fitted — scaling parameters stored in each FeatureSpec
 
     # ─── Plot continuous features as histograms ───
@@ -380,8 +385,8 @@ def main():
     fig.tight_layout(pad=2.0, w_pad=1.5, h_pad=2.0)
     plt.show()
     plot_save = _PROJECT_ROOT / "Plots"  
-    fig.savefig(plot_save / "first_attempt_scaled_data25-26.jpeg")
-    
+    fig.savefig(plot_save / "positional_mask_scaled_data25-26.jpeg")
+
 """    # ─── 5. Training loop ───
 
     model = ...       # your LSTM + MLP model

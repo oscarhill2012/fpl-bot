@@ -26,6 +26,7 @@ from fpl_bot.features import (
     FeatureType,
     ScalingMode,
     AccumulationType,
+    PositionGroup,
     DataSource,
 )
 
@@ -264,6 +265,7 @@ def _build_common_specs(
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.VAASTAV: "saves", DataSource.FCI: "saves"},
+        position_group=PositionGroup.GK,
     ),
     FeatureSpec(
         name="bonus_per_90",
@@ -625,6 +627,7 @@ def _build_common_specs(
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.OPTA: "xgot_faced"},
+        position_group=PositionGroup.GK,
     ),
     FeatureSpec(
         name="goals_prevented_per_90",
@@ -634,6 +637,7 @@ def _build_common_specs(
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.OPTA: "goals_prevented"},
+        position_group=PositionGroup.GK,
     ),
     FeatureSpec(
         name="sweeper_actions_per_90",
@@ -643,6 +647,7 @@ def _build_common_specs(
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.OPTA: "sweeper_actions"},
+        position_group=PositionGroup.GK,
     ),
     FeatureSpec(
         name="high_claim_per_90",
@@ -652,6 +657,7 @@ def _build_common_specs(
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.OPTA: "high_claim"},
+        position_group=PositionGroup.GK,
     ),
     FeatureSpec(
         name="gk_accurate_passes_per_90",
@@ -661,6 +667,7 @@ def _build_common_specs(
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.OPTA: "gk_accurate_passes"},
+        position_group=PositionGroup.GK,
     ),
     FeatureSpec(
         name="gk_accurate_long_balls_per_90",
@@ -670,6 +677,7 @@ def _build_common_specs(
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.OPTA: "gk_accurate_long_balls"},
+        position_group=PositionGroup.GK,
     ),
 
     # ── §5b  Derived per-90 rates ──────────────────────────────────────────

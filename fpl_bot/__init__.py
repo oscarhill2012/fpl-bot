@@ -2,6 +2,7 @@ from .features import (
     FeatureType,
     ScalingMode,
     AccumulationType,
+    PositionGroup,
     DataSource,
     FeatureSpec,
     Features,
