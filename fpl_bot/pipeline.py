@@ -651,12 +651,18 @@ class FeatureScaler:
         x = x.clone()
         presence_mask = self._build_presence_mask(x).to(self.device)
 
+        # fit on present rows only so absent-row sentinels (e.g. per_90 = 0
+        # for players who didn't play) don't corrupt scaler statistics
         x_present = x[presence_mask]
+
+        # collapse [P, G, F] → [P*G, F] for transforming every row
+        p, g, f = x.shape
+        x_flat = x.view(p * g, f)
+
         for (mode, pos_group), scaler in self._scalers.items():
             feat_mask = self.scaling_masks[(mode, pos_group)]
 
             if pos_group is not None and position_ids is not None:
-                # fit only on rows matching the position group
                 pos_row_mask = self._build_position_row_mask(
                     presence_mask, position_ids, pos_group,
                 )
@@ -664,16 +670,16 @@ class FeatureScaler:
             else:
                 scaler.fit(x_present[:, feat_mask])
 
-            # transform ALL present rows with the fitted params
-            x_present[:, feat_mask] = scaler.transform(
-                x_present[:, feat_mask],
+            # transform ALL rows — absent rows still carry valid fixture
+            # data and must be on the same scale as present rows
+            x_flat[:, feat_mask] = scaler.transform(
+                x_flat[:, feat_mask],
             )
 
             param1, param2 = scaler.params
             self._append_params((mode, pos_group), param1, param2)
 
-        # write back scaled values for present rows
-        x[presence_mask] = x_present
+        x = x_flat.view(p, g, f)
 
         self._fitted = True
         return x, self.features.to_dict()
@@ -700,15 +706,15 @@ class FeatureScaler:
 
         self._validate_input(x)
         x = x.clone()
-        presence_mask = self._build_presence_mask(x).to(self.device)
-        x_present = x[presence_mask]
+
+        p, g, f = x.shape
+        x_flat = x.view(p * g, f)
 
         for key, scaler in self._scalers.items():
             feat_mask = self.scaling_masks[key]
-            x_present[:, feat_mask] = scaler.transform(x_present[:, feat_mask])
+            x_flat[:, feat_mask] = scaler.transform(x_flat[:, feat_mask])
 
-        x[presence_mask] = x_present
-        return x
+        return x_flat.view(p, g, f)
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -726,28 +732,27 @@ class FeatureScaler:
         self._validate_input(x)
         x = x.clone()
 
-        #TODO: check this, if presence feature is scaled, now min_value has changed...
-        presence_mask = self._build_presence_mask(x).to(self.device)
-        x_inv = x[presence_mask]
+        p, g, f = x.shape
+        x_flat = x.view(p * g, f)
 
-        # allow inverse to be called after fitting scalers, or with scaling parameters in feature dict
+        # allow inverse to be called after fitting scalers, or with
+        # scaling parameters stored in the feature dict
         for key, scaler in self._scalers.items():
             feat_mask = self.scaling_masks[key]
             if self._fitted:
-                x_inv[:, feat_mask] = scaler.inverse_transform(x_inv[:, feat_mask])
-
+                x_flat[:, feat_mask] = scaler.inverse_transform(
+                    x_flat[:, feat_mask],
+                )
             else:
-                # transpose so shape is [n_params, n_features], for broadcasting convenience
                 params = torch.tensor(
                     [s.scaling_params for s in self.specs_by_mode[key]],
                     dtype=torch.float32,
                 ).T
-                x_inv[:, feat_mask] = scaler.fit_inverse_from_params(
-                    x_inv[:, feat_mask], params,
+                x_flat[:, feat_mask] = scaler.fit_inverse_from_params(
+                    x_flat[:, feat_mask], params,
                 )
 
-        x[presence_mask] = x_inv
-        return x
+        return x_flat.view(p, g, f)
 
     #================================================
     # Private Helpers

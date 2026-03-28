@@ -385,7 +385,7 @@ def main():
     fig.tight_layout(pad=2.0, w_pad=1.5, h_pad=2.0)
     plt.show()
     plot_save = _PROJECT_ROOT / "Plots"  
-    fig.savefig(plot_save / "positional_mask_scaled_data25-26.jpeg")
+    fig.savefig(plot_save / "updated_masking_scaled_data25-26.jpeg")
 
 """    # ─── 5. Training loop ───
 

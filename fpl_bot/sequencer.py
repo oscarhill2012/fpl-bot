@@ -17,6 +17,17 @@ from .priors import PriorData
 
 logger = logging.getLogger(__name__)
 
+# Elo baseline used for prior timesteps where no fixture data exists.
+# Prior rows need a neutral elo value rather than 0 (which would be ~7σ
+# below the real distribution and corrupt scaler statistics).  League mean
+# maps to approximately zero after standardisation, giving the model a
+# "no information" signal that is_prior=1 can gate on.
+_ELO_LEAGUE_MEAN = 1500.0
+
+# Feature names that carry Elo ratings — used by _build_prior_fixtures
+# to assign the league mean instead of the default zero sentinel.
+_ELO_FEATURES = frozenset({"team_elo", "oppo_team_elo"})
+
 
 class SeasonSequencer:
     """
@@ -123,10 +134,23 @@ class SeasonSequencer:
         prior_fixture_row = {}
         for code in self.features._spec_by_name["team_code"].categories:
             prior_fixture_row[code] = {
-                feature: (code if feature == "team_code" else -1 if feature == "is_home" else 0)
+                feature: self._prior_fixture_value(feature, code)
                 for feature in self.features.output_columns_for([DataSource.FIXTURE, DataSource.FIXINGESTER])
             }
         return prior_fixture_row
+
+    @staticmethod
+    def _prior_fixture_value(feature: str, team_code: int) -> float:
+        """Return the default value for a single fixture feature in a prior row."""
+        if feature == "team_code":
+            return team_code
+        if feature == "is_home":
+            return -1
+        # Elo features use the league-mean baseline so they sit near zero
+        # after standardisation, rather than injecting a false outlier signal.
+        if feature in _ELO_FEATURES:
+            return _ELO_LEAGUE_MEAN
+        return 0
 
     def _init_fixture_cache(self) -> "SeasonSequencer":
         """Load fixtures to cache on initialisation. Use _update_team_elo to update future fixture elos."""

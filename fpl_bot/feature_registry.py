@@ -289,7 +289,7 @@ def _build_common_specs(
         name="influence_per_90",
 
         feature_type=FeatureType.SKEWED_POSITIVE,
-        scaling_mode=ScalingMode.ROBUST,
+        scaling_mode=ScalingMode.LOG_ROBUST,
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.VAASTAV: "influence", DataSource.FCI: "influence"},
@@ -298,7 +298,7 @@ def _build_common_specs(
         name="creativity_per_90",
 
         feature_type=FeatureType.SKEWED_POSITIVE,
-        scaling_mode=ScalingMode.ROBUST,
+        scaling_mode=ScalingMode.LOG_ROBUST,
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.VAASTAV: "creativity", DataSource.FCI: "creativity"},
@@ -307,7 +307,7 @@ def _build_common_specs(
         name="threat_per_90",
 
         feature_type=FeatureType.SKEWED_POSITIVE,
-        scaling_mode=ScalingMode.ROBUST,
+        scaling_mode=ScalingMode.LOG_ROBUST,
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.VAASTAV: "threat", DataSource.FCI: "threat"},
@@ -316,7 +316,7 @@ def _build_common_specs(
         name="ict_index_per_90",
 
         feature_type=FeatureType.SKEWED_POSITIVE,
-        scaling_mode=ScalingMode.ROBUST,
+        scaling_mode=ScalingMode.LOG_ROBUST,
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.VAASTAV: "ict_index", DataSource.FCI: "ict_index"},
@@ -378,8 +378,8 @@ def _build_common_specs(
     #   • Most Opta counts are non-negative and right-skewed → LOG_ROBUST
     #   • goals_prevented_per_90 can be negative (GK conceded more than
     #     expected) → ROBUST (no log, which would break on negatives)
-    #   • BPS-like composites (influence, etc.) can have large range
-    #     → ROBUST handles outliers without needing log
+    #   • BPS-like composites (influence, creativity, threat, ict_index)
+    #     have extreme right tails → LOG_ROBUST compresses the tail
 
     # -- Attack --
     FeatureSpec(
@@ -480,7 +480,7 @@ def _build_common_specs(
         name="touches_per_90",
 
         feature_type=FeatureType.SKEWED_POSITIVE,
-        scaling_mode=ScalingMode.ROBUST,
+        scaling_mode=ScalingMode.LOG_ROBUST,
         accumulation=AccumulationType.PER_90,
         temporal=True,
         source={DataSource.OPTA: "touches"},
