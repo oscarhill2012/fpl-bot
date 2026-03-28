@@ -358,7 +358,13 @@ def main():
     train_ds.apply_scaled(scaled_train.cpu())
     val_ds.apply_scaler(scaler)
 
-    # ─── 5(d). Create DataLoaders ───
+    # ─── 5(d). Scale targets ───
+    # Use the same ROBUST params fitted for the "points" input feature.
+    points_median, points_iqr = features25["points"].scaling_params
+    train_ds.scale_targets(points_median, points_iqr)
+    val_ds.scale_targets(points_median, points_iqr)
+
+    # ─── 5(e). Create DataLoaders ───
     # Created AFTER scaling so persistent workers see the cached data.
     train_loader = DataLoader(
         train_ds,
@@ -421,13 +427,14 @@ def main():
         weight_decay=weight_decay,
         grad_clip=grad_clip,
         device=device,
+        target_iqr=points_iqr,
     )
 
     # ─── 9. Train ───
     history = trainer.fit(
         epochs=epochs,
         patience=patience,
-        run_version="testing",
+        run_version="tuned_LTSM_MLP",
     )
 
     # ─── 10. (Optional) Save final model explicitly ───

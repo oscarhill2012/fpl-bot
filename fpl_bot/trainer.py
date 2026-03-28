@@ -31,14 +31,15 @@ class TrainHistory:
     Attributes:
         train_loss: Mean training MSE per epoch.
         val_loss: Mean validation MSE per epoch.
-        val_mae: Mean validation MAE per epoch (more interpretable ---
-            "predictions are off by X points on average").
+        val_mae: Mean validation MAE per epoch (scaled space).
+        val_mae_points: Mean validation MAE in real FPL points.
         lr: Learning rate at the end of each epoch.
     """
 
     train_loss: list[float] = field(default_factory=list)
     val_loss: list[float] = field(default_factory=list)
     val_mae: list[float] = field(default_factory=list)
+    val_mae_points: list[float] = field(default_factory=list)
     lr: list[float] = field(default_factory=list)
 
     grad_norm: list[float] = field(default_factory=list)
@@ -69,6 +70,9 @@ class Trainer:
         grad_clip: Maximum gradient norm.  Gradients exceeding this
             are rescaled proportionally.
         device: Torch device.  Defaults to CUDA if available, else CPU.
+        target_iqr: IQR of the target feature from ROBUST scaling.
+            When set, validation MAE is converted back to real FPL
+            points via ``scaled_mae * iqr``.
     """
 
     def __init__(
@@ -80,6 +84,7 @@ class Trainer:
         weight_decay: float = 0.0,
         grad_clip: float = 1.0,
         device: torch.device | None = None,
+        target_iqr: float | None = None,
     ):
         """Initialise trainer with model, data, and hyperparameters."""
         self.device = device or torch.device(
@@ -89,6 +94,7 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.grad_clip = grad_clip
+        self.target_iqr = target_iqr
 
         self.criterion = nn.MSELoss()
         self.optimiser = torch.optim.Adam(
@@ -146,7 +152,10 @@ class Trainer:
 
         for epoch in epoch_bar:
             train_loss, grad_norm = self._train_epoch()
-            val_loss, val_mae, val_mae_by_horizon, pred_mean, pred_std = self._validate()
+            (
+                val_loss, val_mae, val_mae_points,
+                val_mae_by_horizon, pred_mean, pred_std,
+            ) = self._validate()
             current_lr = self.optimiser.param_groups[0]["lr"]
 
             self.scheduler.step(val_loss)
@@ -155,6 +164,7 @@ class Trainer:
             history.train_loss.append(train_loss)
             history.val_loss.append(val_loss)
             history.val_mae.append(val_mae)
+            history.val_mae_points.append(val_mae_points)
             history.lr.append(current_lr)
 
             history.grad_norm.append(grad_norm)
@@ -166,7 +176,7 @@ class Trainer:
             epoch_bar.set_postfix(
                 train=f"{train_loss:.4f}",
                 val=f"{val_loss:.4f}",
-                mae=f"{val_mae:.2f}",
+                mae=f"{val_mae_points:.2f}pts",
                 lr=f"{current_lr:.1e}",
             )
 
@@ -174,6 +184,7 @@ class Trainer:
             writer.add_scalar("Loss/train", train_loss, epoch)
             writer.add_scalar("Loss/val", val_loss, epoch)
             writer.add_scalar("MAE/val", val_mae, epoch)
+            writer.add_scalar("MAE/val_points", val_mae_points, epoch)
             writer.add_scalar("LR", current_lr, epoch)
 
             writer.add_scalar("Train/grad_norm", grad_norm, epoch)
@@ -181,7 +192,7 @@ class Trainer:
             writer.add_scalar("Pred/std", pred_std, epoch)
 
             for k, mae_k in enumerate(val_mae_by_horizon):
-                writer.add_scalar(f"MAE/GW+{k+1}", mae_k, epoch)
+                writer.add_scalar(f"MAE_points/GW+{k+1}", mae_k, epoch)
 
             # Early stopping check
             if val_loss < best_val_loss:
@@ -208,8 +219,8 @@ class Trainer:
 
         logger.info(
             "Training complete: %d epochs, best val loss %.4f, "
-            "final val MAE %.2f",
-            epoch + 1, best_val_loss, history.val_mae[-1],
+            "final val MAE %.2f pts",
+            epoch + 1, best_val_loss, history.val_mae_points[-1],
         )
 
         writer.close()
@@ -320,8 +331,10 @@ class Trainer:
 
         return total_loss / n_batches, total_grad_norm / n_batches
 
-    def _validate(self) -> tuple[float, float, list[float], float, float]:
-        """Run validation and return (mean_loss, mean_mae)."""
+    def _validate(
+        self,
+    ) -> tuple[float, float, float, list[float], float, float]:
+        """Run validation and return loss, MAE, real-points MAE, and diagnostics."""
         self.model.eval()
         total_loss = 0.0
         total_mae = 0.0
@@ -358,9 +371,14 @@ class Trainer:
         mean_loss = total_loss.item() / n_batches
         mean_mae = total_mae.item() / n_batches
 
+        # Convert to real FPL points: scaled_mae * IQR
+        iqr = self.target_iqr if self.target_iqr is not None else 1.0
+        mean_mae_points = mean_mae * iqr
+
         mae_by_horizon = (
             total_abs_error_by_horizon.cpu()
             / len(self.val_loader.dataset)
+            * iqr
         ).tolist()
 
         pred_mean = pred_sum.item() / pred_count
@@ -369,7 +387,10 @@ class Trainer:
         )
         pred_std = pred_var ** 0.5
 
-        return mean_loss, mean_mae, mae_by_horizon, pred_mean, pred_std
+        return (
+            mean_loss, mean_mae, mean_mae_points,
+            mae_by_horizon, pred_mean, pred_std,
+        )
 
     def _resolve_output_dir(self, run_version: str) -> pathlib.Path:
         """Resolve the run output directory, creating it if needed."""
@@ -406,10 +427,11 @@ class Trainer:
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-        # MAE
+        # MAE (real points)
         ax = axes[0, 1]
-        ax.plot(epochs, history.val_mae)
-        ax.set_title("Validation MAE")
+        ax.plot(epochs, history.val_mae_points)
+        ax.set_title("Validation MAE (points)")
+        ax.set_ylabel("MAE (FPL points)")
         ax.grid(True, alpha=0.3)
 
         # LR
@@ -430,11 +452,12 @@ class Trainer:
         fig.savefig(run_dir / "training_summary.png", dpi=200)
         plt.close(fig)
 
-        # Horizon MAE
+        # Horizon MAE (real points)
         if history.val_mae_by_horizon:
             final_mae = history.val_mae_by_horizon[-1]
             fig, ax = plt.subplots()
             ax.bar([f"GW+{i+1}" for i in range(len(final_mae))], final_mae)
-            ax.set_title("Final MAE by Horizon")
+            ax.set_title("Final MAE by Horizon (points)")
+            ax.set_ylabel("MAE (FPL points)")
             fig.savefig(run_dir / "final_horizon_mae.png", dpi=200)
             plt.close(fig)

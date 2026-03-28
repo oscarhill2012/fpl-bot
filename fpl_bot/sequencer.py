@@ -853,6 +853,33 @@ class FPLDataset(Dataset):
         scaled_numeric = scaler.test_scale(self.stacked_numeric()).cpu()
         self.apply_scaled(scaled_numeric)
 
+    def scale_targets(self, median: float, iqr: float) -> None:
+        """
+        Scale cached target values using ROBUST scaler parameters.
+
+        Applies the same normalisation used for the "points" input feature
+        so that the model predicts in a consistent scaled space.
+
+        Must be called after ``cache()``.
+
+        Args:
+            median: Location parameter (median of training points).
+            iqr: Scale parameter (IQR of training points).
+
+        Raises:
+            RuntimeError: If called before cache().
+        """
+        if self._cache is None:
+            raise RuntimeError("Call cache() before scale_targets().")
+
+        for sample in self._cache:
+            sample["y"] = (sample["y"] - median) / iqr
+
+        logger.info(
+            "Scaled %d target vectors (median=%.2f, iqr=%.2f).",
+            len(self._cache), median, iqr,
+        )
+
     #================================================
     # Inspection Helpers
     #================================================
