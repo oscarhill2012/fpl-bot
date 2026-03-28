@@ -333,6 +333,33 @@ def main():
     # ─── 5. Create DataLoaders ───
 
     batch_size = 128
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ─── 5(a). Cache raw samples ───
+    # Build all samples once; avoids repeated build_player_window calls.
+    train_ds.cache()
+    val_ds.cache()
+
+    # ─── 5(b). Fit scaler on training data and scale both splits ───
+    all_x_numeric = train_ds.stacked_numeric()
+    position_ids = torch.tensor([
+        player_meta.loc[pid, "position"]
+        for pid, _ in train_ds.sample_index
+    ])
+
+    scaled_features = features25.filtered_numeric
+    scaler = FeatureScaler(scaled_features, device=device)
+    scaled_train, _ = scaler.train_scale(
+        all_x_numeric, position_ids=position_ids,
+    )
+
+    # ─── 5(c). Scale cached samples ───
+    # Training data uses train_scale result directly; validation via test_scale.
+    train_ds.apply_scaled(scaled_train.cpu())
+    val_ds.apply_scaler(scaler)
+
+    # ─── 5(d). Create DataLoaders ───
+    # Created AFTER scaling so persistent workers see the cached data.
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -349,25 +376,6 @@ def main():
         num_workers=2,
         persistent_workers=True,
     )
- 
-    # ─── 6. Fit the scaler on training data ───
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    all_x_numeric = []
-    all_position_ids = []
-
-    for batch in train_loader:
-        all_x_numeric.append(batch["x_numeric"])
-        all_position_ids.append(batch["x_categorical"][:, 0, 0])
-
-    all_x_numeric = torch.cat(all_x_numeric, dim=0)
-    position_ids = torch.cat(all_position_ids, dim=0)
-
-
-    scaled_features = features25.filtered_numeric
-    scaler = FeatureScaler(scaled_features, device=device)
-
-    # IMPORTANT: fit scaler BEFORE training
-    scaler.train_scale(all_x_numeric, position_ids=position_ids)
 
     # ─── 7(a). Build model ───
     # All model and training parameters live here for easy grid search.
@@ -407,7 +415,6 @@ def main():
 
     trainer = Trainer(
         model=model,
-        scaler=scaler,
         train_loader=train_loader,
         val_loader=val_loader,
         lr=learning_rate,

@@ -11,9 +11,9 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import json
 from tqdm.auto import tqdm
+import shutil
 
 from .model import FPLPointsPredictor
-from .pipeline import FeatureScaler
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +57,13 @@ class Trainer:
     Manages training and validation of an FPLPointsPredictor.
 
     Owns the optimiser, loss function, scheduler, and training loop.
-    The fitted ``FeatureScaler`` is applied per-batch during forward
-    passes so the ``DataLoader`` yields raw data throughout.
+    Expects DataLoaders whose datasets have already been pre-scaled
+    via ``FPLDataset.pre_scale`` — no per-batch scaling is performed.
 
     Args:
         model: The model to train.
-        scaler: A *fitted* FeatureScaler (``train_scale`` already called).
-        train_loader: DataLoader yielding training batches.
-        val_loader: DataLoader yielding validation batches.
+        train_loader: DataLoader yielding pre-scaled training batches.
+        val_loader: DataLoader yielding pre-scaled validation batches.
         lr: Initial learning rate for Adam.
         weight_decay: L2 penalty coefficient.  Set to 0 to disable.
         grad_clip: Maximum gradient norm.  Gradients exceeding this
@@ -75,7 +74,6 @@ class Trainer:
     def __init__(
         self,
         model: FPLPointsPredictor,
-        scaler: FeatureScaler,
         train_loader: DataLoader,
         val_loader: DataLoader,
         lr: float = 1e-3,
@@ -88,7 +86,6 @@ class Trainer:
             "cuda" if torch.cuda.is_available() else "cpu",
         )
         self.model = model.to(self.device)
-        self.scaler = scaler
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.grad_clip = grad_clip
@@ -142,6 +139,7 @@ class Trainer:
             epochs, patience, output_dir,
         )
 
+        shutil.rmtree(output_dir / "tensorboard", ignore_errors=True)
         history = TrainHistory()
         writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
         epoch_bar = tqdm(range(epochs), desc="Training", unit="epoch")
@@ -301,16 +299,12 @@ class Trainer:
         n_batches = 0
         
         for batch in self.train_loader:
-            # Scale on CPU (scaler params are CPU tensors), then move
-            x_scaled = self.scaler.test_scale(
-                batch["x_numeric"],
-            ).to(self.device)
-
+            x_numeric = batch["x_numeric"].to(self.device)
             x_cat = batch["x_categorical"].to(self.device)
             x_fix = batch["x_future_fixtures"].to(self.device)
             y = batch["y"].to(self.device)
 
-            pred = self.model(x_scaled, x_cat, x_fix)
+            pred = self.model(x_numeric, x_cat, x_fix)
             loss = self.criterion(pred, y)
 
             self.optimiser.zero_grad()
@@ -339,15 +333,12 @@ class Trainer:
 
         with torch.no_grad():
             for batch in self.val_loader:
-                x_scaled = self.scaler.test_scale(
-                    batch["x_numeric"],
-                ).to(self.device)
-
+                x_numeric = batch["x_numeric"].to(self.device)
                 x_cat = batch["x_categorical"].to(self.device)
                 x_fix = batch["x_future_fixtures"].to(self.device)
                 y = batch["y"].to(self.device)
 
-                pred = self.model(x_scaled, x_cat, x_fix)
+                pred = self.model(x_numeric, x_cat, x_fix)
 
                 abs_err = torch.abs(pred - y)
                 horizon_abs = abs_err.sum(dim=0)

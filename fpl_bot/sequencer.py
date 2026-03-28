@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-import math 
+from tqdm.auto import tqdm
 
 from .features import Features, FeatureSpec, FeatureType, DataSource
 from .ingester import Ingester, FPLSourceConfig, FixtureSourceConfig
 from .player_team_index import player_team_index
 from .priors import PriorData
+
+if TYPE_CHECKING:
+    from .pipeline import FeatureScaler
 
 logger = logging.getLogger(__name__)
 
@@ -691,6 +695,8 @@ class FPLDataset(Dataset):
             for player_team_id in players
         ]
 
+        self._cache: list[dict[str, torch.Tensor]] | None = None
+
         logger.info(
             "FPLDataset created: %d players x GW%d-%d = %d samples",
             len(players), gw_start, gw_end, len(self._sample_index),
@@ -709,6 +715,9 @@ class FPLDataset(Dataset):
         """
         Retrieve a single training sample as a dictionary of tensors.
 
+        If ``pre_scale`` has been called, returns the cached (pre-scaled)
+        sample directly.  Otherwise builds it from the sequencer on the fly.
+
         Args:
             idx: Integer index into the sample index.
 
@@ -719,14 +728,17 @@ class FPLDataset(Dataset):
                 x_future_fixtures: long tensor, shape [K, fix_features].
                 y: float32 tensor, shape [target_window_size].
         """
+        if self._cache is not None:
+            return self._cache[idx]
+
         player_team_code, target_gw = self._sample_index[idx]
 
         sample = self.sequencer.build_player_window(
-            player_team_code, 
+            player_team_code,
             target_gw,
             inference=self._inference,
             )
-        
+
         return {
             "x_numeric": torch.tensor(
                 sample["x_numeric"], dtype=torch.float32,
@@ -741,6 +753,105 @@ class FPLDataset(Dataset):
                 sample["y"], dtype=torch.float32,
             ),
         }
+
+    #================================================
+    # Pre-scaling
+    #================================================
+
+    def cache(self) -> None:
+        """
+        Build all samples once and store as raw (unscaled) tensors.
+
+        After calling this method, ``__getitem__`` returns from cache
+        instead of rebuilding each sample from the sequencer.  Call
+        ``apply_scaler`` afterwards to scale the cached numeric features.
+        """
+        raw_samples: list[dict[str, torch.Tensor]] = []
+
+        for player_team_code, target_gw in tqdm(
+            self._sample_index,
+            desc="Caching samples",
+            leave=False,
+        ):
+            sample = self.sequencer.build_player_window(
+                player_team_code,
+                target_gw,
+                inference=self._inference,
+            )
+            raw_samples.append({
+                "x_numeric": torch.tensor(
+                    sample["x_numeric"], dtype=torch.float32,
+                ),
+                "x_categorical": torch.tensor(
+                    sample["x_categorical"], dtype=torch.long,
+                ),
+                "x_future_fixtures": torch.tensor(
+                    sample["x_future_fixtures"], dtype=torch.long,
+                ),
+                "y": torch.tensor(
+                    sample["y"], dtype=torch.float32,
+                ),
+            })
+
+        self._cache = raw_samples
+        logger.info("Cached %d raw samples.", len(self._cache))
+
+    def stacked_numeric(self) -> torch.Tensor:
+        """
+        Stack all cached numeric features into a single tensor.
+
+        Returns:
+            Tensor of shape [N_samples, T, F_numeric].
+
+        Raises:
+            RuntimeError: If called before cache().
+        """
+        if self._cache is None:
+            raise RuntimeError("Call cache() before stacked_numeric().")
+        return torch.stack([s["x_numeric"] for s in self._cache])
+
+    def apply_scaled(self, scaled_numeric: torch.Tensor) -> None:
+        """
+        Write pre-scaled numeric features back into the sample cache.
+
+        Args:
+            scaled_numeric: Tensor of shape [N_samples, T, F_numeric],
+                one row per cached sample.
+
+        Raises:
+            RuntimeError: If called before cache().
+            ValueError: If sample count does not match cache size.
+        """
+        if self._cache is None:
+            raise RuntimeError("Call cache() before apply_scaled().")
+        if scaled_numeric.shape[0] != len(self._cache):
+            raise ValueError(
+                f"Expected {len(self._cache)} samples, "
+                f"got {scaled_numeric.shape[0]}."
+            )
+
+        for i, s in enumerate(self._cache):
+            s["x_numeric"] = scaled_numeric[i]
+
+        logger.info(
+            "Applied scaled numerics to %d cached samples (%.1f MB).",
+            len(self._cache),
+            scaled_numeric.element_size() * scaled_numeric.nelement() / 1e6,
+        )
+
+    def apply_scaler(self, scaler: FeatureScaler) -> None:
+        """
+        Scale the cached numeric features in place using a fitted scaler.
+
+        Must be called after ``cache()``.  The scaler must already be
+        fitted via ``train_scale``.
+
+        Args:
+            scaler: A fitted FeatureScaler whose ``test_scale`` will be
+                applied to all numeric features in a single batched call.
+        """
+        scaled_numeric = scaler.test_scale(self.stacked_numeric()).cpu()
+        self.apply_scaled(scaled_numeric)
 
     #================================================
     # Inspection Helpers
