@@ -312,11 +312,10 @@ class Trainer:
 
             pred = self.model(x_scaled, x_cat, x_fix)
             loss = self.criterion(pred, y)
-            grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
             self.optimiser.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(
+            grad_norm = nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.grad_clip,
             )
             self.optimiser.step()
@@ -351,27 +350,32 @@ class Trainer:
                 pred = self.model(x_scaled, x_cat, x_fix)
 
                 abs_err = torch.abs(pred - y)
-                horizon_abs = abs_err.sum(dim=0).detach().cpu()
+                horizon_abs = abs_err.sum(dim=0)
                 if total_abs_error_by_horizon is None:
                     total_abs_error_by_horizon = horizon_abs.clone()
                 else:
                     total_abs_error_by_horizon += horizon_abs
 
-               
-                pred_sum += pred.sum().item()
-                pred_sq_sum += (pred ** 2).sum().item()
+                pred_sum += pred.sum()
+                pred_sq_sum += (pred ** 2).sum()
                 pred_count += pred.numel()
-                total_loss += self.criterion(pred, y).item()
-                total_mae += torch.mean(torch.abs(pred - y)).item()
+                total_loss += self.criterion(pred, y)
+                total_mae += abs_err.mean()
                 n_batches += 1
 
-        mean_loss = total_loss / n_batches
-        mean_mae = total_mae / n_batches
+        # Sync to CPU once at epoch end rather than per-batch
+        mean_loss = total_loss.item() / n_batches
+        mean_mae = total_mae.item() / n_batches
 
-        mae_by_horizon = (total_abs_error_by_horizon / len(self.val_loader.dataset)).tolist()
+        mae_by_horizon = (
+            total_abs_error_by_horizon.cpu()
+            / len(self.val_loader.dataset)
+        ).tolist()
 
-        pred_mean = pred_sum / pred_count
-        pred_var = max((pred_sq_sum / pred_count) - pred_mean**2, 0.0)
+        pred_mean = pred_sum.item() / pred_count
+        pred_var = max(
+            (pred_sq_sum.item() / pred_count) - pred_mean ** 2, 0.0,
+        )
         pred_std = pred_var ** 0.5
 
         return mean_loss, mean_mae, mae_by_horizon, pred_mean, pred_std

@@ -274,25 +274,6 @@ _PLAYER_POS_ID = {
 }
 
 def main():
-
-    # ─── 0. Hyperparameters ───
-    # All model and training parameters live here for easy grid search.
-
-    # Model architecture
-    lstm_hidden_dim = 128
-    lstm_layers = 2
-    mlp_hidden_dim = 64
-    dropout = 0.2
-    n_fixture_features = 5
-
-    # Training
-    batch_size = 128
-    learning_rate = 5e-4
-    weight_decay = 1e-4
-    grad_clip = 1.0
-    epochs = 100
-    patience = 15
-
     # ─── 1. Set up Seasons ───
     # ─── 1(a). 25/26 ───
 
@@ -351,8 +332,23 @@ def main():
 
     # ─── 5. Create DataLoaders ───
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    batch_size = 128
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=2,
+        persistent_workers=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=2,
+        persistent_workers=True,
+    )
  
     # ─── 6. Fit the scaler on training data ───
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -373,8 +369,25 @@ def main():
     # IMPORTANT: fit scaler BEFORE training
     scaler.train_scale(all_x_numeric, position_ids=position_ids)
 
+    # ─── 7(a). Build model ───
+    # All model and training parameters live here for easy grid search.
 
-    # ─── 7. Build model ───
+    # Model architecture
+    lstm_hidden_dim = 128
+    lstm_layers = 2
+    mlp_hidden_dim = 64
+    dropout = 0.2
+    n_fixture_features = 5
+
+    # Training
+
+    learning_rate = 5e-4
+    weight_decay = 1e-4
+    grad_clip = 1.0
+    epochs = 100
+    patience = 15
+
+    # ─── 7(b). Build model ───
 
     model = FPLPointsPredictor.from_features(
         features25,
@@ -402,7 +415,6 @@ def main():
         grad_clip=grad_clip,
         device=device,
     )
-
 
     # ─── 9. Train ───
     history = trainer.fit(
