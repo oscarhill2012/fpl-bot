@@ -274,7 +274,25 @@ _PLAYER_POS_ID = {
 }
 
 def main():
-    
+
+    # ─── 0. Hyperparameters ───
+    # All model and training parameters live here for easy grid search.
+
+    # Model architecture
+    lstm_hidden_dim = 128
+    lstm_layers = 2
+    mlp_hidden_dim = 64
+    dropout = 0.2
+    n_fixture_features = 5
+
+    # Training
+    batch_size = 128
+    learning_rate = 5e-4
+    weight_decay = 1e-4
+    grad_clip = 1.0
+    epochs = 100
+    patience = 15
+
     # ─── 1. Set up Seasons ───
     # ─── 1(a). 25/26 ───
 
@@ -333,11 +351,11 @@ def main():
 
     # ─── 5. Create DataLoaders ───
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)  
-    val_loader   = DataLoader(val_ds, batch_size=64, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
  
     # ─── 6. Fit the scaler on training data ───
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     all_x_numeric = []
     all_position_ids = []
 
@@ -349,8 +367,6 @@ def main():
     position_ids = torch.cat(all_position_ids, dim=0)
 
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     scaled_features = features25.filtered_numeric
     scaler = FeatureScaler(scaled_features, device=device)
 
@@ -360,7 +376,14 @@ def main():
 
     # ─── 7. Build model ───
 
-    model = FPLPointsPredictor.from_features(features25)
+    model = FPLPointsPredictor.from_features(
+        features25,
+        n_fixture_features=n_fixture_features,
+        lstm_hidden_dim=lstm_hidden_dim,
+        lstm_layers=lstm_layers,
+        mlp_hidden_dim=mlp_hidden_dim,
+        dropout=dropout,
+    )
 
     # (optional but recommended debug)
     print(f"Using device: {device}")
@@ -374,18 +397,18 @@ def main():
         scaler=scaler,
         train_loader=train_loader,
         val_loader=val_loader,
-        lr=1e-3,
-        weight_decay=1e-5,   # small regularisation helps
-        grad_clip=1.0,
+        lr=learning_rate,
+        weight_decay=weight_decay,
+        grad_clip=grad_clip,
         device=device,
     )
 
 
     # ─── 9. Train ───
-
     history = trainer.fit(
-        epochs=100,
-        patience=15,
+        epochs=epochs,
+        patience=patience,
+        run_version="testing",
     )
 
     # ─── 10. (Optional) Save final model explicitly ───

@@ -621,6 +621,52 @@ class FeatureScaler:
         ).unsqueeze(0)
         return min_vals, max_vals
 
+    def _build_presence_indices(self):
+        """Build index tensors for presence-checked features, used in presence masking."""
+        # presence indices built from features input upon initialisation
+        indices = []
+        min_values = []
+
+        for i, spec in enumerate(self.features.specs):
+            if spec.presence_check:
+                indices.append(i)
+                min_values.append(spec.min_value)
+
+        if indices:
+            # torch.long is signed integers, both shape [1, n_presence_features]
+            self._presence_indices = torch.tensor(indices, dtype=torch.long, device=self.device)
+            self._presence_min_values = torch.tensor(min_values, dtype=torch.float32, device=self.device)
+        else:
+            # None makes presence act as identity
+            self._presence_indices = None
+            self._presence_min_values = None
+
+    def _build_presence_mask(self, x: torch.Tensor) -> torch.Tensor:
+        """Build a [batch, time] boolean mask; True where all presence-checked features exceed their min_value."""
+        # presence mask built from data and presence indices,
+        # so can only be called upon scale, inverse as requires data tensor x
+        if self._presence_indices is None:
+            # returns all True, allows all data through, no presence filtering
+            # output shape is [n_samples, n_timesteps]
+            return torch.ones(x.shape[0], x.shape[1], dtype=torch.bool)
+
+        # if sample at time step has presence feature > threshold (min_val)
+        # that sample for that time is given to scaler
+        x_check = x[:,:, self._presence_indices].to(self.device)
+        mask = (x_check > self._presence_min_values).all(dim=-1)
+        return mask
+
+    def _build_position_row_mask(
+        self,
+        presence_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        pos_group: PositionGroup,
+    ) -> torch.Tensor:
+        """Build a [N_present] boolean mask selecting present rows from a position group."""
+        pos_mask = (position_ids == pos_group.value).unsqueeze(1)
+        pos_expanded = pos_mask.expand_as(presence_mask)
+        return pos_expanded[presence_mask]
+
     #================================================
     # Public Functions
     #================================================
@@ -648,7 +694,8 @@ class FeatureScaler:
             Tuple of (scaled tensor, features dict with fitted scaling params).
         """
         self._validate_input(x)
-        x = x.clone()
+        x = x.clone().to(self.device)
+        position_ids = position_ids.clone().to(self.device)
         presence_mask = self._build_presence_mask(x).to(self.device)
 
         # fit on present rows only so absent-row sentinels (e.g. per_90 = 0
@@ -705,7 +752,7 @@ class FeatureScaler:
             raise RuntimeError('Fit training data before scaling Test')
 
         self._validate_input(x)
-        x = x.clone()
+        x = x.clone().to(self.device)
 
         p, g, f = x.shape
         x_flat = x.view(p * g, f)
@@ -730,7 +777,7 @@ class FeatureScaler:
             Unscaled tensor of the same shape.
         """
         self._validate_input(x)
-        x = x.clone()
+        x = x.clone().to(self.device)
 
         p, g, f = x.shape
         x_flat = x.view(p * g, f)
@@ -757,52 +804,6 @@ class FeatureScaler:
     #================================================
     # Private Helpers
     #================================================
-
-    def _build_presence_indices(self):
-        """Build index tensors for presence-checked features, used in presence masking."""
-        # presence indices built from features input upon initialisation
-        indices = []
-        min_values = []
-
-        for i, spec in enumerate(self.features.specs):
-            if spec.presence_check:
-                indices.append(i)
-                min_values.append(spec.min_value)
-
-        if indices:
-            # torch.long is signed integers, both shape [1, n_presence_features]
-            self._presence_indices = torch.tensor(indices, dtype=torch.long, device=self.device)
-            self._presence_min_values = torch.tensor(min_values, dtype=torch.float32, device=self.device)
-        else:
-            # None makes presence act as identity
-            self._presence_indices = None
-            self._presence_min_values = None
-
-    def _build_presence_mask(self, x: torch.Tensor) -> torch.Tensor:
-        """Build a [batch, time] boolean mask; True where all presence-checked features exceed their min_value."""
-        # presence mask built from data and presence indices,
-        # so can only be called upon scale, inverse as requires data tensor x
-        if self._presence_indices is None:
-            # returns all True, allows all data through, no presence filtering
-            # output shape is [n_samples, n_timesteps]
-            return torch.ones(x.shape[0], x.shape[1], dtype=torch.bool)
-
-        # if sample at time step has presence feature > threshold (min_val)
-        # that sample for that time is given to scaler
-        x_check = x[:,:, self._presence_indices].to(self.device)
-        mask = (x_check > self._presence_min_values).all(dim=-1)
-        return mask
-
-    def _build_position_row_mask(
-        self,
-        presence_mask: torch.Tensor,
-        position_ids: torch.Tensor,
-        pos_group: PositionGroup,
-    ) -> torch.Tensor:
-        """Build a [N_present] boolean mask selecting present rows from a position group."""
-        pos_mask = (position_ids == pos_group.value).unsqueeze(1)
-        pos_expanded = pos_mask.expand_as(presence_mask)
-        return pos_expanded[presence_mask]
 
     def _append_params(
         self,

@@ -4,10 +4,13 @@ import logging
 import pathlib
 from dataclasses import dataclass, field
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+import json
+from tqdm.auto import tqdm
 
 from .model import FPLPointsPredictor
 from .pipeline import FeatureScaler
@@ -37,6 +40,11 @@ class TrainHistory:
     val_loss: list[float] = field(default_factory=list)
     val_mae: list[float] = field(default_factory=list)
     lr: list[float] = field(default_factory=list)
+
+    grad_norm: list[float] = field(default_factory=list)
+    pred_mean: list[float] = field(default_factory=list)
+    pred_std: list[float] = field(default_factory=list)
+    val_mae_by_horizon: list[list[float]] = field(default_factory=list)
 
 
 # ============================================================================
@@ -108,7 +116,7 @@ class Trainer:
         self,
         epochs: int,
         patience: int = 10,
-        checkpoint_dir: pathlib.Path | str | None = None,
+        run_version: str = "default",
     ) -> TrainHistory:
         """
         Run the full training loop with early stopping.
@@ -117,28 +125,30 @@ class Trainer:
             epochs: Maximum number of training epochs.
             patience: Stop training after this many epochs without
                 validation loss improvement.
-            checkpoint_dir: Directory for saving model checkpoints.
-                If ``None``, defaults to ``<project_root>/checkpoints``.
+            run_version: Subdirectory name under ``model_performance/``
+                for this run's outputs (checkpoints, dashboard).
 
         Returns:
             TrainHistory with per-epoch metrics.
         """
-        checkpoint_dir = self._resolve_checkpoint_dir(checkpoint_dir)
+        output_dir = self._resolve_output_dir(run_version)
         history = TrainHistory()
         best_val_loss = float("inf")
         epochs_without_improvement = 0
 
         logger.info(
             "Starting training: %d epochs, patience=%d, "
-            "checkpoint_dir=%s",
-            epochs, patience, checkpoint_dir,
+            "output_dir=%s",
+            epochs, patience, output_dir,
         )
 
+        history = TrainHistory()
+        writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
         epoch_bar = tqdm(range(epochs), desc="Training", unit="epoch")
 
         for epoch in epoch_bar:
-            train_loss = self._train_epoch()
-            val_loss, val_mae = self._validate()
+            train_loss, grad_norm = self._train_epoch()
+            val_loss, val_mae, val_mae_by_horizon, pred_mean, pred_std = self._validate()
             current_lr = self.optimiser.param_groups[0]["lr"]
 
             self.scheduler.step(val_loss)
@@ -149,6 +159,11 @@ class Trainer:
             history.val_mae.append(val_mae)
             history.lr.append(current_lr)
 
+            history.grad_norm.append(grad_norm)
+            history.pred_mean.append(pred_mean)
+            history.pred_std.append(pred_std)
+            history.val_mae_by_horizon.append(val_mae_by_horizon)
+
             # Update progress bar
             epoch_bar.set_postfix(
                 train=f"{train_loss:.4f}",
@@ -157,12 +172,25 @@ class Trainer:
                 lr=f"{current_lr:.1e}",
             )
 
+            # Populate TensorBoard
+            writer.add_scalar("Loss/train", train_loss, epoch)
+            writer.add_scalar("Loss/val", val_loss, epoch)
+            writer.add_scalar("MAE/val", val_mae, epoch)
+            writer.add_scalar("LR", current_lr, epoch)
+
+            writer.add_scalar("Train/grad_norm", grad_norm, epoch)
+            writer.add_scalar("Pred/mean", pred_mean, epoch)
+            writer.add_scalar("Pred/std", pred_std, epoch)
+
+            for k, mae_k in enumerate(val_mae_by_horizon):
+                writer.add_scalar(f"MAE/GW+{k+1}", mae_k, epoch)
+
             # Early stopping check
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 epochs_without_improvement = 0
                 self.save_checkpoint(
-                    checkpoint_dir / "best_model.pt", epoch, best_val_loss,
+                    output_dir / "best_model.pt", epoch, best_val_loss,
                 )
             else:
                 epochs_without_improvement += 1
@@ -177,7 +205,7 @@ class Trainer:
 
         # Save final checkpoint regardless of early stopping
         self.save_checkpoint(
-            checkpoint_dir / "final_model.pt", epoch, val_loss,
+            output_dir / "final_model.pt", epoch, val_loss,
         )
 
         logger.info(
@@ -185,6 +213,10 @@ class Trainer:
             "final val MAE %.2f",
             epoch + 1, best_val_loss, history.val_mae[-1],
         )
+
+        writer.close()
+        self._save_training_summary_plot(output_dir, history, best_val_loss)
+        self._save_history_json(output_dir / "training_history.json", history)
 
         return history
 
@@ -261,23 +293,26 @@ class Trainer:
     # Private Helpers
     #=====================================================
 
-    def _train_epoch(self) -> float:
+    def _train_epoch(self) -> tuple[float, float]:
         """Run one training epoch and return mean batch loss."""
         self.model.train()
         total_loss = 0.0
+        total_grad_norm = 0.0
         n_batches = 0
-
+        
         for batch in self.train_loader:
             # Scale on CPU (scaler params are CPU tensors), then move
             x_scaled = self.scaler.test_scale(
                 batch["x_numeric"],
             ).to(self.device)
+
             x_cat = batch["x_categorical"].to(self.device)
             x_fix = batch["x_future_fixtures"].to(self.device)
             y = batch["y"].to(self.device)
 
             pred = self.model(x_scaled, x_cat, x_fix)
             loss = self.criterion(pred, y)
+            grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
             self.optimiser.zero_grad()
             loss.backward()
@@ -286,45 +321,125 @@ class Trainer:
             )
             self.optimiser.step()
 
+            total_grad_norm += float(grad_norm)
             total_loss += loss.item()
             n_batches += 1
 
-        return total_loss / n_batches
+        return total_loss / n_batches, total_grad_norm / n_batches
 
-    def _validate(self) -> tuple[float, float]:
+    def _validate(self) -> tuple[float, float, list[float], float, float]:
         """Run validation and return (mean_loss, mean_mae)."""
         self.model.eval()
         total_loss = 0.0
         total_mae = 0.0
         n_batches = 0
+        total_abs_error_by_horizon = None
+        pred_sum = 0.0
+        pred_sq_sum = 0.0
+        pred_count = 0
 
         with torch.no_grad():
             for batch in self.val_loader:
                 x_scaled = self.scaler.test_scale(
                     batch["x_numeric"],
                 ).to(self.device)
+
                 x_cat = batch["x_categorical"].to(self.device)
                 x_fix = batch["x_future_fixtures"].to(self.device)
                 y = batch["y"].to(self.device)
 
                 pred = self.model(x_scaled, x_cat, x_fix)
+
+                abs_err = torch.abs(pred - y)
+                horizon_abs = abs_err.sum(dim=0).detach().cpu()
+                if total_abs_error_by_horizon is None:
+                    total_abs_error_by_horizon = horizon_abs.clone()
+                else:
+                    total_abs_error_by_horizon += horizon_abs
+
+               
+                pred_sum += pred.sum().item()
+                pred_sq_sum += (pred ** 2).sum().item()
+                pred_count += pred.numel()
                 total_loss += self.criterion(pred, y).item()
                 total_mae += torch.mean(torch.abs(pred - y)).item()
                 n_batches += 1
 
-        return total_loss / n_batches, total_mae / n_batches
+        mean_loss = total_loss / n_batches
+        mean_mae = total_mae / n_batches
 
-    def _resolve_checkpoint_dir(
-        self,
-        checkpoint_dir: pathlib.Path | str | None,
-    ) -> pathlib.Path:
-        """Resolve checkpoint directory, creating it if needed."""
-        if checkpoint_dir is not None:
-            path = pathlib.Path(checkpoint_dir)
-        else:
-            path = (
-                pathlib.Path(__file__).resolve().parents[1]
-                / "checkpoints"
-            )
+        mae_by_horizon = (total_abs_error_by_horizon / len(self.val_loader.dataset)).tolist()
+
+        pred_mean = pred_sum / pred_count
+        pred_var = max((pred_sq_sum / pred_count) - pred_mean**2, 0.0)
+        pred_std = pred_var ** 0.5
+
+        return mean_loss, mean_mae, mae_by_horizon, pred_mean, pred_std
+
+    def _resolve_output_dir(self, run_version: str) -> pathlib.Path:
+        """Resolve the run output directory, creating it if needed."""
+        path = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "model_performance" / run_version
+        )
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+
+    def _save_history_json(self, path: pathlib.Path, history: TrainHistory) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(history.__dict__, f, indent=2)
+
+
+    def _save_training_summary_plot(
+        self,
+        run_dir: pathlib.Path,
+        history: TrainHistory,
+        best_val_loss: float,
+    ) -> None:
+        epochs = range(1, len(history.train_loss) + 1)
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # Loss
+        ax = axes[0, 0]
+        ax.plot(epochs, history.train_loss, label="train")
+        ax.plot(epochs, history.val_loss, label="val")
+        ax.axhline(best_val_loss, linestyle="--", alpha=0.7)
+        ax.set_ylim(0, 10)
+        ax.set_title("Loss")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # MAE
+        ax = axes[0, 1]
+        ax.plot(epochs, history.val_mae)
+        ax.set_title("Validation MAE")
+        ax.grid(True, alpha=0.3)
+
+        # LR
+        ax = axes[1, 0]
+        ax.plot(epochs, history.lr)
+        ax.set_title("Learning Rate")
+        ax.grid(True, alpha=0.3)
+
+        # Generalisation gap
+        ax = axes[1, 1]
+        gap = [v - t for t, v in zip(history.train_loss, history.val_loss)]
+        ax.plot(epochs, gap)
+        ax.set_ylim(-10, 10)
+        ax.set_title("Generalisation Gap")
+        ax.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        fig.savefig(run_dir / "training_summary.png", dpi=200)
+        plt.close(fig)
+
+        # Horizon MAE
+        if history.val_mae_by_horizon:
+            final_mae = history.val_mae_by_horizon[-1]
+            fig, ax = plt.subplots()
+            ax.bar([f"GW+{i+1}" for i in range(len(final_mae))], final_mae)
+            ax.set_title("Final MAE by Horizon")
+            fig.savefig(run_dir / "final_horizon_mae.png", dpi=200)
+            plt.close(fig)
