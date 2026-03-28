@@ -1,0 +1,433 @@
+"""
+FPL points predictor model.
+
+Encodes a player's recent gameweek history with an LSTM, then combines
+the learned context vector with upcoming fixture difficulty via an MLP
+head to predict Fantasy Premier League points.
+
+Architecture
+------------
+
+.. code-block:: text
+
+    x_numeric     [B, T, F]  --- (pre-scaled) ------------------+
+                                                                 |
+    x_categorical [B, T, C]  --> nn.Embedding --> [B, T, E]  ---+
+                                                                 |
+                              cat(numeric, embedded) --> LSTM --> h_T [B, H]
+                                                                       |
+    x_future_fixtures [B, K, fix] -------------------------------------+
+                                                                       |
+                                 cat(h_T, fixture_k) --> MLP --> pred [B, K]
+
+B = batch size, T = input window length (gameweeks of history),
+F = numeric feature count, C = number of categorical features,
+E = total embedding dimensionality, H = LSTM hidden size,
+K = predict window (target gameweeks to predict).
+
+The MLP head is applied independently to each target gameweek via
+parameter sharing.  This means the same head works for K = 1 (single-
+GW prediction) and K > 1 (multi-GW) without retraining, though it
+does not model dependencies *between* target GWs.  For a future model
+that captures inter-GW effects (fatigue, rotation), an autoregressive
+decoder or cross-attention mechanism would be needed.
+
+
+Deep Learning Techniques Used
+-----------------------------
+
+**Embedding layers** (``nn.Embedding``)
+    Categorical features like position and team code are integers with
+    no meaningful numeric ordering --- team 3 is not "more" than
+    team 1.  An embedding layer is a learnable lookup table that maps
+    each integer index to a dense vector.  The model discovers useful
+    relationships during training (e.g., that midfielders and forwards
+    share attacking patterns).  Index 0 is reserved as padding and
+    always produces a zero vector (``padding_idx=0``).
+
+**LSTM** (Long Short-Term Memory)
+    A recurrent neural network that reads the sequence one timestep at
+    a time, maintaining an internal memory cell.  Unlike a vanilla RNN,
+    the LSTM uses gating mechanisms (forget, input, output gates) to
+    selectively remember or discard information, mitigating the
+    vanishing gradient problem over long sequences.  The final hidden
+    state ``h_T`` is a fixed-size summary --- the "context vector" ---
+    of the player's recent history.
+
+**Layer normalisation** (``nn.LayerNorm``)
+    Normalises the context vector to zero mean and unit variance across
+    its features.  Without this, LSTM activations can drift to extreme
+    values during training, destabilising gradient updates.  LayerNorm
+    is preferred over BatchNorm for sequence models because it operates
+    per-sample (no dependence on batch statistics), making it robust to
+    small or variable batch sizes.
+
+**Dropout** (``nn.Dropout``)
+    Randomly zeroes a fraction of activations during training, forcing
+    the model to distribute learned representations across multiple
+    neurons rather than relying on a few.  This acts as a regulariser
+    that reduces overfitting.  Dropout is automatically disabled during
+    evaluation (``model.eval()``).
+
+**Xavier initialisation** (``nn.init.xavier_uniform_``)
+    Sets initial weights so that the variance of activations remains
+    roughly constant across layers.  Poor initialisation can cause
+    gradients to vanish (weights too small) or explode (too large),
+    making early training erratic.  Xavier init is the standard default
+    for linear layers followed by symmetric activations like ReLU.
+
+**Orthogonal initialisation** (``nn.init.orthogonal_``)
+    Initialises LSTM weight matrices as orthogonal matrices, preserving
+    gradient magnitude during backpropagation through time.  This is
+    especially helpful for longer sequences where gradients must flow
+    back many timesteps without shrinking or growing.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import torch
+import torch.nn as nn
+
+from .features import Features
+
+logger = logging.getLogger(__name__)
+
+
+class FPLPointsPredictor(nn.Module):
+    """
+    LSTM encoder + MLP decoder for FPL points prediction.
+
+    Consumes the three tensors produced by ``FPLDataset``: scaled
+    numeric features, categorical integer indices, and future fixture
+    context.  Returns predicted points for each gameweek in the
+    predict window.
+
+    Args:
+        n_numeric_features: Number of scaled numeric input features.
+        categorical_vocab_sizes: Vocabulary size per categorical
+            feature, including the padding index.  Position has 4
+            real categories + 1 padding = 5.
+        categorical_embedding_dims: Embedding dimensionality per
+            categorical feature.  Must match the length of
+            ``categorical_vocab_sizes``.
+        n_fixture_features: Features per target gameweek in
+            ``x_future_fixtures`` (team_elo, oppo_team_elo, is_home,
+            num_matches, team_code = 5).  Note: team_code also
+            appears as an embedded categorical input; it is present
+            in the fixture cache because the ingester indexes by
+            team_code with ``drop=False``.
+        lstm_hidden_dim: LSTM hidden state size.  Controls the
+            capacity of the context vector.
+        lstm_layers: Number of stacked LSTM layers.  More layers
+            allow more abstract temporal patterns but increase
+            overfitting risk on small datasets.
+        mlp_hidden_dim: Width of the MLP decoder's hidden layers.
+        dropout: Dropout probability for LSTM (between layers) and
+            MLP (between hidden layers).
+    """
+
+    def __init__(
+        self,
+        n_numeric_features: int,
+        categorical_vocab_sizes: list[int],
+        categorical_embedding_dims: list[int],
+        n_fixture_features: int,
+        lstm_hidden_dim: int = 128,
+        lstm_layers: int = 2,
+        mlp_hidden_dim: int = 64,
+        dropout: float = 0.2,
+    ):
+        """Initialise model layers and apply weight initialisation."""
+        super().__init__()
+
+        if len(categorical_vocab_sizes) != len(categorical_embedding_dims):
+            raise ValueError(
+                "categorical_vocab_sizes and "
+                "categorical_embedding_dims must have the same length."
+            )
+
+        # Store configuration for serialisation and inspection.
+        self.n_numeric_features = n_numeric_features
+        self.n_fixture_features = n_fixture_features
+        self.lstm_hidden_dim = lstm_hidden_dim
+        self.lstm_layers = lstm_layers
+
+        #=====================================================
+        # Embedding Layers
+        # One nn.Embedding per categorical feature. Index 0 is
+        # reserved as padding and always returns a zero vector.
+        #=====================================================
+
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(vocab, dim, padding_idx=0)
+            for vocab, dim in zip(
+                categorical_vocab_sizes,
+                categorical_embedding_dims,
+            )
+        ])
+        total_embedding_dim = sum(categorical_embedding_dims)
+
+        #=====================================================
+        # LSTM Encoder
+        # Reads the gameweek sequence and compresses it into a
+        # fixed-size context vector (final hidden state).
+        #=====================================================
+
+        lstm_input_dim = n_numeric_features + total_embedding_dim
+        self.encoder = nn.LSTM(
+            input_size=lstm_input_dim,
+            hidden_size=lstm_hidden_dim,
+            num_layers=lstm_layers,
+            batch_first=True,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+        )
+
+        #=====================================================
+        # Context Normalisation
+        # LayerNorm stabilises the LSTM output before the MLP.
+        #=====================================================
+
+        self.context_norm = nn.LayerNorm(lstm_hidden_dim)
+
+        #=====================================================
+        # MLP Decoder
+        # Combines context vector with fixture difficulty to
+        # predict points. Applied per target gameweek.
+        #=====================================================
+
+        decoder_input_dim = lstm_hidden_dim + n_fixture_features
+        self.decoder = nn.Sequential(
+            nn.Linear(decoder_input_dim, mlp_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, mlp_hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim // 2, 1),
+        )
+
+        self._initialise_weights()
+
+        # Log architecture summary for debugging.
+        param_count = sum(p.numel() for p in self.parameters())
+        logger.info(
+            "FPLPointsPredictor: LSTM(%d -> %d, %d layers) "
+            "+ MLP(%d -> %d -> %d -> 1), %d params",
+            lstm_input_dim, lstm_hidden_dim, lstm_layers,
+            decoder_input_dim, mlp_hidden_dim,
+            mlp_hidden_dim // 2, param_count,
+        )
+
+    #=====================================================
+    # Factory Methods
+    # Construct the model from project-level objects.
+    #=====================================================
+
+    @classmethod
+    def from_features(
+        cls,
+        features: Features,
+        n_fixture_features: int = 5,
+        lstm_hidden_dim: int = 128,
+        lstm_layers: int = 2,
+        mlp_hidden_dim: int = 64,
+        dropout: float = 0.2,
+    ) -> FPLPointsPredictor:
+        """
+        Construct the model from a Features registry.
+
+        Extracts numeric feature count, categorical vocabulary sizes,
+        and embedding dimensions directly from the registry.
+
+        Args:
+            features: Feature registry describing all model inputs.
+            n_fixture_features: Fixture features per target gameweek.
+                Defaults to 5 (team_elo, oppo_team_elo, is_home,
+                num_matches, team_code).
+            lstm_hidden_dim: LSTM hidden state size.
+            lstm_layers: Number of stacked LSTM layers.
+            mlp_hidden_dim: MLP hidden layer width.
+            dropout: Dropout probability.
+
+        Returns:
+            Configured FPLPointsPredictor instance.
+        """
+        n_numeric = len(features.numeric_columns)
+
+        cat_specs = [
+            features[name]
+            for name in features.categorical_columns
+        ]
+
+        # Vocab size = highest possible index + 1 (slot 0 is padding).
+        # Integer categories (e.g. team_code) use raw values as indices,
+        # so we need max(codes) + 1.  String categories (e.g. position)
+        # are mapped to sequential 1..N, so len + 1 suffices.
+        vocab_sizes = []
+        for spec in cat_specs:
+            if all(isinstance(c, int) for c in spec.categories):
+                vocab_sizes.append(max(spec.categories) + 1)
+            else:
+                vocab_sizes.append(len(spec.categories) + 1)
+
+        embedding_dims = [
+            spec.embedding_dim for spec in cat_specs
+        ]
+
+        logger.info(
+            "from_features: %d numeric, %d categorical (%s), "
+            "%d fixture features",
+            n_numeric,
+            len(cat_specs),
+            ", ".join(
+                f"{s.name}({v} -> {d}d)"
+                for s, v, d in zip(
+                    cat_specs, vocab_sizes, embedding_dims,
+                )
+            ),
+            n_fixture_features,
+        )
+
+        return cls(
+            n_numeric_features=n_numeric,
+            categorical_vocab_sizes=vocab_sizes,
+            categorical_embedding_dims=embedding_dims,
+            n_fixture_features=n_fixture_features,
+            lstm_hidden_dim=lstm_hidden_dim,
+            lstm_layers=lstm_layers,
+            mlp_hidden_dim=mlp_hidden_dim,
+            dropout=dropout,
+        )
+
+    #=====================================================
+    # Forward Pass
+    # Core inference logic.
+    #=====================================================
+
+    def forward(
+        self,
+        x_numeric: torch.Tensor,
+        x_categorical: torch.Tensor,
+        x_future_fixtures: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run the full encoder-decoder forward pass.
+
+        Args:
+            x_numeric: Scaled numeric features.
+                Shape ``[B, T, F]``.
+            x_categorical: Integer category indices.
+                Shape ``[B, T, C]``.
+            x_future_fixtures: Fixture context for target gameweeks.
+                Shape ``[B, K, fix_feat]``.  Cast to float internally
+                (the dataset provides these as ``torch.long``).
+
+        Returns:
+            Predicted points.  Shape ``[B, K]`` where K is the number
+            of target gameweeks in the predict window.
+        """
+        batch_size = x_numeric.shape[0]
+        predict_window = x_future_fixtures.shape[1]
+
+        # --- Embed categorical features ---
+        # Each embedding layer maps one column of integer indices to a
+        # dense vector.  Results are concatenated along the feature
+        # dimension to form the full embedded representation.
+        embedded = [
+            emb(x_categorical[:, :, i])
+            for i, emb in enumerate(self.embeddings)
+        ]
+        x_emb = torch.cat(embedded, dim=-1)  # [B, T, E]
+
+        # --- Encode the gameweek sequence ---
+        # Concatenate numeric features and embeddings, then pass
+        # through the LSTM.  The final hidden state of the last
+        # layer becomes the context vector.
+        lstm_input = torch.cat(
+            [x_numeric, x_emb], dim=-1,
+        )  # [B, T, F + E]
+        _, (h_n, _) = self.encoder(lstm_input)
+
+        # h_n shape: [num_layers, B, H].  Take the last layer and
+        # normalise to stabilise scale before the MLP.
+        context = self.context_norm(h_n[-1])  # [B, H]
+
+        # --- Decode: predict points per target gameweek ---
+        # The MLP head is shared across all K target GWs (parameter
+        # sharing).  Expand the context to pair with each fixture row,
+        # then batch all K predictions in one pass.
+        fixtures = x_future_fixtures.float()  # [B, K, fix]
+
+        context_expanded = context.unsqueeze(1).expand(
+            -1, predict_window, -1,
+        )  # [B, K, H]
+
+        mlp_input = torch.cat(
+            [context_expanded, fixtures], dim=-1,
+        )  # [B, K, H + fix]
+
+        # Flatten K into the batch dimension for a single MLP pass,
+        # then reshape back to [B, K].
+        flat = mlp_input.reshape(
+            batch_size * predict_window, -1,
+        )  # [B*K, H + fix]
+        predictions = self.decoder(flat)  # [B*K, 1]
+
+        return predictions.reshape(batch_size, predict_window)
+
+    #=====================================================
+    # Inference Helpers
+    # Convenience methods for evaluation and prediction.
+    #=====================================================
+
+    @torch.no_grad()
+    def predict(
+        self,
+        x_numeric: torch.Tensor,
+        x_categorical: torch.Tensor,
+        x_future_fixtures: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Predict points with gradients disabled.
+
+        Sets the model to evaluation mode (disabling dropout), runs
+        the forward pass without gradient tracking, then restores the
+        previous training mode.
+
+        Args:
+            x_numeric: Scaled numeric features, ``[B, T, F]``.
+            x_categorical: Category indices, ``[B, T, C]``.
+            x_future_fixtures: Fixture context, ``[B, K, fix]``.
+
+        Returns:
+            Predicted points, ``[B, K]``.
+        """
+        was_training = self.training
+        self.eval()
+        predictions = self(
+            x_numeric, x_categorical, x_future_fixtures,
+        )
+        if was_training:
+            self.train()
+        return predictions
+
+    #=====================================================
+    # Private Helpers
+    #=====================================================
+
+    def _initialise_weights(self) -> None:
+        """Apply Xavier init to linear layers, orthogonal init to LSTM."""
+        for name, param in self.encoder.named_parameters():
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param)
+            elif "bias" in name:
+                nn.init.zeros_(param)
+
+        for module in self.decoder:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)

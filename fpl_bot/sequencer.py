@@ -5,7 +5,6 @@ import math
 
 import numpy as np
 import pandas as pd
-from sympy.core import Float
 import torch
 from torch.utils.data import Dataset
 import math 
@@ -22,7 +21,7 @@ logger = logging.getLogger(__name__)
 # below the real distribution and corrupt scaler statistics).  League mean
 # maps to approximately zero after standardisation, giving the model a
 # "no information" signal that is_prior=1 can gate on.
-_ELO_LEAGUE_MEAN = 1500.0
+_ELO_LEAGUE_MEAN = 1800.0
 
 # Feature names that carry Elo ratings — used by _build_prior_fixtures
 # to assign the league mean instead of the default zero sentinel.
@@ -442,10 +441,10 @@ class SeasonSequencer:
             [window_size, n_numeric] and [window_size, n_categorical].
         """
         # guard against, target_gw being out of ingested data range
-        if target_gw <= 0 or (target_gw + self._target_window_size) > 38:
+        if target_gw <= 0 or (target_gw + self._target_window_size - 1) > 38:
             raise ValueError("Target window must lie within GW1-38")
         if not inference:
-            if (target_gw + self._target_window_size) >= self._current_gameweek:
+            if (target_gw + self._target_window_size) > self._current_gameweek:
                 raise ValueError("Target window contains un-ingested GW, set inference = True, or ingest.")
                 
         # static categorical codes, constant across timesteps
@@ -587,7 +586,10 @@ class SeasonSequencer:
         current_data = self.player_cache[gw][player_team_id]
 
         if current_data["price"] == 0:
-            print(gw)
+            logger.warning(
+                "Player %s has price=0 at GW%d after backfill.",
+                player_team_id, gw,
+            )
         prior_row.update({
             "price": current_data["price"],
             "transfers_in": current_data["transfers_in"],
@@ -656,7 +658,7 @@ class FPLDataset(Dataset):
                 f"gw_end ({gw_end}) must be >= gw_start ({gw_start})."
             )
 
-        target_end = gw_end + sequencer._target_window_size
+        target_end = gw_end + sequencer._target_window_size - 1
         if target_end > 38:
             raise ValueError(
                 f"Target window extends to GW{target_end}, beyond GW38."
@@ -717,7 +719,7 @@ class FPLDataset(Dataset):
                 x_future_fixtures: long tensor, shape [K, fix_features].
                 y: float32 tensor, shape [target_window_size].
         """
-        player_team_code, target_gw = self.sample_index[idx]
+        player_team_code, target_gw = self._sample_index[idx]
 
         sample = self.sequencer.build_player_window(
             player_team_code, 

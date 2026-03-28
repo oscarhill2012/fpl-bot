@@ -132,9 +132,7 @@ class FixtureProvider:
 
         gw_fixtures = (
             gw_fixtures
-            .filter(items=self.output_cols)         # select only output columns
-            .round()                                # round any ELOs
-            .astype(np.int64)                       # set as ints       
+            .filter(items=self.output_cols)         # select only output columns     
         )
 
         gw_fixtures = self._flatten_dgw(gw_fixtures)
@@ -251,7 +249,7 @@ class GameweekProvider:
         features: Features,
         config: FPLSourceConfig,
         season_root: str,
-        minimum_minutes: int = 45,
+        minimum_minutes: float = 90.0,
     ):
         """
         Initialise a GameweekProvider.

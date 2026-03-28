@@ -6,8 +6,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from sympy.core import Float
-
 from .features import Features, FeatureSpec, FeatureType, DataSource
 from .player_team_index import player_team_index
 

@@ -1,0 +1,330 @@
+from __future__ import annotations
+
+import logging
+import pathlib
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from .model import FPLPointsPredictor
+from .pipeline import FeatureScaler
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Training history
+# ============================================================================
+
+
+@dataclass
+class TrainHistory:
+    """
+    Container for per-epoch training metrics.
+
+    Attributes:
+        train_loss: Mean training MSE per epoch.
+        val_loss: Mean validation MSE per epoch.
+        val_mae: Mean validation MAE per epoch (more interpretable ---
+            "predictions are off by X points on average").
+        lr: Learning rate at the end of each epoch.
+    """
+
+    train_loss: list[float] = field(default_factory=list)
+    val_loss: list[float] = field(default_factory=list)
+    val_mae: list[float] = field(default_factory=list)
+    lr: list[float] = field(default_factory=list)
+
+
+# ============================================================================
+# Trainer
+# ============================================================================
+
+
+class Trainer:
+    """
+    Manages training and validation of an FPLPointsPredictor.
+
+    Owns the optimiser, loss function, scheduler, and training loop.
+    The fitted ``FeatureScaler`` is applied per-batch during forward
+    passes so the ``DataLoader`` yields raw data throughout.
+
+    Args:
+        model: The model to train.
+        scaler: A *fitted* FeatureScaler (``train_scale`` already called).
+        train_loader: DataLoader yielding training batches.
+        val_loader: DataLoader yielding validation batches.
+        lr: Initial learning rate for Adam.
+        weight_decay: L2 penalty coefficient.  Set to 0 to disable.
+        grad_clip: Maximum gradient norm.  Gradients exceeding this
+            are rescaled proportionally.
+        device: Torch device.  Defaults to CUDA if available, else CPU.
+    """
+
+    def __init__(
+        self,
+        model: FPLPointsPredictor,
+        scaler: FeatureScaler,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+        grad_clip: float = 1.0,
+        device: torch.device | None = None,
+    ):
+        """Initialise trainer with model, data, and hyperparameters."""
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu",
+        )
+        self.model = model.to(self.device)
+        self.scaler = scaler
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.grad_clip = grad_clip
+
+        self.criterion = nn.MSELoss()
+        self.optimiser = torch.optim.Adam(
+            model.parameters(), lr=lr, weight_decay=weight_decay,
+        )
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimiser, mode="min", factor=0.5, patience=5,
+        )
+
+        param_count = sum(p.numel() for p in model.parameters())
+        logger.info(
+            "Trainer initialised: %d params, device=%s, lr=%.1e, "
+            "grad_clip=%.1f, weight_decay=%.1e",
+            param_count, self.device, lr, grad_clip, weight_decay,
+        )
+
+    #=====================================================
+    # Public Interface
+    #=====================================================
+
+    def fit(
+        self,
+        epochs: int,
+        patience: int = 10,
+        checkpoint_dir: pathlib.Path | str | None = None,
+    ) -> TrainHistory:
+        """
+        Run the full training loop with early stopping.
+
+        Args:
+            epochs: Maximum number of training epochs.
+            patience: Stop training after this many epochs without
+                validation loss improvement.
+            checkpoint_dir: Directory for saving model checkpoints.
+                If ``None``, defaults to ``<project_root>/checkpoints``.
+
+        Returns:
+            TrainHistory with per-epoch metrics.
+        """
+        checkpoint_dir = self._resolve_checkpoint_dir(checkpoint_dir)
+        history = TrainHistory()
+        best_val_loss = float("inf")
+        epochs_without_improvement = 0
+
+        logger.info(
+            "Starting training: %d epochs, patience=%d, "
+            "checkpoint_dir=%s",
+            epochs, patience, checkpoint_dir,
+        )
+
+        epoch_bar = tqdm(range(epochs), desc="Training", unit="epoch")
+
+        for epoch in epoch_bar:
+            train_loss = self._train_epoch()
+            val_loss, val_mae = self._validate()
+            current_lr = self.optimiser.param_groups[0]["lr"]
+
+            self.scheduler.step(val_loss)
+
+            # Record metrics
+            history.train_loss.append(train_loss)
+            history.val_loss.append(val_loss)
+            history.val_mae.append(val_mae)
+            history.lr.append(current_lr)
+
+            # Update progress bar
+            epoch_bar.set_postfix(
+                train=f"{train_loss:.4f}",
+                val=f"{val_loss:.4f}",
+                mae=f"{val_mae:.2f}",
+                lr=f"{current_lr:.1e}",
+            )
+
+            # Early stopping check
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_without_improvement = 0
+                self.save_checkpoint(
+                    checkpoint_dir / "best_model.pt", epoch, best_val_loss,
+                )
+            else:
+                epochs_without_improvement += 1
+
+            if epochs_without_improvement >= patience:
+                logger.info(
+                    "Early stopping at epoch %d — no improvement "
+                    "for %d epochs. Best val loss: %.4f",
+                    epoch, patience, best_val_loss,
+                )
+                break
+
+        # Save final checkpoint regardless of early stopping
+        self.save_checkpoint(
+            checkpoint_dir / "final_model.pt", epoch, val_loss,
+        )
+
+        logger.info(
+            "Training complete: %d epochs, best val loss %.4f, "
+            "final val MAE %.2f",
+            epoch + 1, best_val_loss, history.val_mae[-1],
+        )
+
+        return history
+
+    #=====================================================
+    # Checkpointing
+    # Save and restore model, optimiser, and scheduler.
+    #=====================================================
+
+    def save_checkpoint(
+        self,
+        path: pathlib.Path,
+        epoch: int,
+        val_loss: float,
+    ) -> None:
+        """
+        Save a training checkpoint.
+
+        Args:
+            path: File path for the checkpoint.
+            epoch: Current epoch number.
+            val_loss: Validation loss at this epoch.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "epoch": epoch,
+                "val_loss": val_loss,
+                "model_state_dict": self.model.state_dict(),
+                "optimiser_state_dict": self.optimiser.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+            },
+            path,
+        )
+        logger.debug("Checkpoint saved to %s (epoch %d)", path, epoch)
+
+    def load_checkpoint(self, path: pathlib.Path) -> dict:
+        """
+        Load a training checkpoint and restore model/optimiser state.
+
+        Args:
+            path: Path to a saved checkpoint file.
+
+        Returns:
+            The full checkpoint dict (includes epoch and val_loss).
+
+        Raises:
+            FileNotFoundError: If the checkpoint file does not exist.
+        """
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint not found: {path}"
+            )
+
+        # weights_only=False required because the checkpoint includes
+        # optimiser and scheduler state (Python dicts, not just tensors)
+        checkpoint = torch.load(
+            path, map_location=self.device, weights_only=False,
+        )
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimiser.load_state_dict(
+            checkpoint["optimiser_state_dict"],
+        )
+        self.scheduler.load_state_dict(
+            checkpoint["scheduler_state_dict"],
+        )
+
+        logger.info(
+            "Loaded checkpoint from %s (epoch %d, val_loss %.4f)",
+            path, checkpoint["epoch"], checkpoint["val_loss"],
+        )
+        return checkpoint
+
+    #=====================================================
+    # Private Helpers
+    #=====================================================
+
+    def _train_epoch(self) -> float:
+        """Run one training epoch and return mean batch loss."""
+        self.model.train()
+        total_loss = 0.0
+        n_batches = 0
+
+        for batch in self.train_loader:
+            # Scale on CPU (scaler params are CPU tensors), then move
+            x_scaled = self.scaler.test_scale(
+                batch["x_numeric"],
+            ).to(self.device)
+            x_cat = batch["x_categorical"].to(self.device)
+            x_fix = batch["x_future_fixtures"].to(self.device)
+            y = batch["y"].to(self.device)
+
+            pred = self.model(x_scaled, x_cat, x_fix)
+            loss = self.criterion(pred, y)
+
+            self.optimiser.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.grad_clip,
+            )
+            self.optimiser.step()
+
+            total_loss += loss.item()
+            n_batches += 1
+
+        return total_loss / n_batches
+
+    def _validate(self) -> tuple[float, float]:
+        """Run validation and return (mean_loss, mean_mae)."""
+        self.model.eval()
+        total_loss = 0.0
+        total_mae = 0.0
+        n_batches = 0
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                x_scaled = self.scaler.test_scale(
+                    batch["x_numeric"],
+                ).to(self.device)
+                x_cat = batch["x_categorical"].to(self.device)
+                x_fix = batch["x_future_fixtures"].to(self.device)
+                y = batch["y"].to(self.device)
+
+                pred = self.model(x_scaled, x_cat, x_fix)
+                total_loss += self.criterion(pred, y).item()
+                total_mae += torch.mean(torch.abs(pred - y)).item()
+                n_batches += 1
+
+        return total_loss / n_batches, total_mae / n_batches
+
+    def _resolve_checkpoint_dir(
+        self,
+        checkpoint_dir: pathlib.Path | str | None,
+    ) -> pathlib.Path:
+        """Resolve checkpoint directory, creating it if needed."""
+        if checkpoint_dir is not None:
+            path = pathlib.Path(checkpoint_dir)
+        else:
+            path = (
+                pathlib.Path(__file__).resolve().parents[1]
+                / "checkpoints"
+            )
+        path.mkdir(parents=True, exist_ok=True)
+        return path

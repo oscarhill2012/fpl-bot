@@ -1,8 +1,6 @@
 import logging
-import math
 import pathlib
 
-import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -11,12 +9,13 @@ from fpl_bot import (
     DataSource,
     Features,
     FPLSourceConfig,
+    FPLPointsPredictor,
     FixtureSourceConfig,
     SeasonSequencer,
+    Trainer,
     build_features24,
     build_features25,
     player_team_index,
-    Features,
     FeatureScaler,
 )
 
@@ -351,88 +350,25 @@ def main():
 
     scaled_features = features25.filtered_numeric
     scaler = FeatureScaler(scaled_features)
-    scaled_train, features_dict = scaler.train_scale(
-        all_x_numeric, position_ids=position_ids,
+    scaler.train_scale(all_x_numeric, position_ids=position_ids)
+    # scaler is now fitted — test_scale() will apply these params per batch
+
+    # ─── 7. Build model from feature registry ───
+
+    model = FPLPointsPredictor.from_features(features25)
+
+    # ─── 8. Train ───
+
+    trainer = Trainer(
+        model=model,
+        scaler=scaler,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        lr=1e-3,
+        grad_clip=1.0,
     )
-    # scaler is now fitted — scaling parameters stored in each FeatureSpec
 
-    # ─── Plot continuous features as histograms ───
-    n_features = scaled_train.shape[-1]
-    numeric_names = scaled_features.numeric_columns
-    plot_cols = 8
-    plot_rows = math.ceil(n_features / plot_cols)
-
-    fig, axes = plt.subplots(plot_rows, plot_cols, figsize=(4 * plot_cols, 3 * plot_rows))
-    axes = axes.flatten()
-
-    # Flatten batch and time dimensions to get per-feature distributions
-    flat = scaled_train.reshape(-1, n_features)
-
-    for i in range(n_features):
-
-        ax = axes[i]
-        values = flat[:, i].numpy()
-        ax.hist(values, bins=40, edgecolor="black", linewidth=0.4)
-        ax.set_yscale("log")
-        ax.set_title(numeric_names[i], fontsize=9)
-        ax.tick_params(labelsize=7)
-
-    # Hide unused subplots
-    for j in range(n_features, len(axes)):
-        axes[j].set_visible(False)
-
-    fig.suptitle("Numeric Feature Distributions", fontsize=12)
-    fig.tight_layout(pad=2.0, w_pad=1.5, h_pad=2.0)
-    plt.show()
-    plot_save = _PROJECT_ROOT / "Plots"  
-    fig.savefig(plot_save / "updated_masking_scaled_data25-26.jpeg")
-
-"""    # ─── 5. Training loop ───
-
-    model = ...       # your LSTM + MLP model
-    optimiser = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = torch.nn.MSELoss()
-
-    for epoch in range(num_epochs):
-        model.train()
-
-        for batch in train_loader:
-            # Unpack the batch — each value is a tensor with batch dim 0
-            x_cont = batch["x_numeric"]        # [B, T, F_cont]
-            x_cat  = batch["x_categorical"]       # [B, T, C]
-            x_fix  = batch["x_future_fixtures"]   # [B, K, fix_features]
-            y      = batch["y"]                   # [B, target_window_size]
-
-            # Scale numeric features using the fitted scaler
-            # test_scale uses parameters from train_scale — no data leakage
-            x_scaled = scaler.test_scale(x_cont)  # [B, T, F_cont]
-
-            # Forward pass — model handles embedding internally
-            pred = model(x_scaled, x_cat, x_fix)  # [B, 1]
-            loss = criterion(pred, y)
-
-            # Backward pass
-            optimiser.zero_grad()
-            loss.backward()
-            optimiser.step()
-
-        # ─── Validation ───
-        model.eval()
-        val_loss = 0.0
-
-        with torch.no_grad():
-            for batch in val_loader:
-                x_cont = batch["x_numeric"]
-                x_cat  = batch["x_categorical"]
-                x_fix  = batch["x_future_fixtures"]
-                y      = batch["y"]
-
-                x_scaled = scaler.test_scale(x_cont)
-                pred = model(x_scaled, x_cat, x_fix)
-                val_loss += criterion(pred, y).item()
-
-        print(f"Epoch {epoch}: val_loss = {val_loss / len(val_loader):.4f}")
-"""
+    history = trainer.fit(epochs=100, patience=15)
 
 if __name__ == "__main__":
     main()
