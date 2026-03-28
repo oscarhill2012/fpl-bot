@@ -1,6 +1,8 @@
 import logging
+import math
 import pathlib
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -9,14 +11,15 @@ from fpl_bot import (
     DataSource,
     Features,
     FPLSourceConfig,
-    FPLPointsPredictor,
     FixtureSourceConfig,
     SeasonSequencer,
-    Trainer,
     build_features24,
     build_features25,
     player_team_index,
+    Features,
     FeatureScaler,
+    Trainer,
+    FPLPointsPredictor,
 )
 
 logging.basicConfig(
@@ -334,30 +337,37 @@ def main():
     val_loader   = DataLoader(val_ds, batch_size=64, shuffle=False)
  
     # ─── 6. Fit the scaler on training data ───
-    # Collect all training x_numeric and position IDs for fitting.
-    # Position IDs enable position-aware scaling for GK-specific features.
 
     all_x_numeric = []
     all_position_ids = []
+
     for batch in train_loader:
         all_x_numeric.append(batch["x_numeric"])
-        # position is first categorical, constant across timesteps
         all_position_ids.append(batch["x_categorical"][:, 0, 0])
 
-    # Stack into [N_total, T, F] — this IS the [P, G, F] convention
     all_x_numeric = torch.cat(all_x_numeric, dim=0)
     position_ids = torch.cat(all_position_ids, dim=0)
 
-    scaled_features = features25.filtered_numeric
-    scaler = FeatureScaler(scaled_features)
-    scaler.train_scale(all_x_numeric, position_ids=position_ids)
-    # scaler is now fitted — test_scale() will apply these params per batch
 
-    # ─── 7. Build model from feature registry ───
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    scaled_features = features25.filtered_numeric
+    scaler = FeatureScaler(scaled_features, device=device)
+
+    # IMPORTANT: fit scaler BEFORE training
+    scaler.train_scale(all_x_numeric, position_ids=position_ids)
+
+
+    # ─── 7. Build model ───
 
     model = FPLPointsPredictor.from_features(features25)
 
-    # ─── 8. Train ───
+    # (optional but recommended debug)
+    print(f"Using device: {device}")
+    print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
+
+
+    # ─── 8. Initialise Trainer ───
 
     trainer = Trainer(
         model=model,
@@ -365,10 +375,23 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         lr=1e-3,
+        weight_decay=1e-5,   # small regularisation helps
         grad_clip=1.0,
+        device=device,
     )
 
-    history = trainer.fit(epochs=100, patience=15)
+
+    # ─── 9. Train ───
+
+    history = trainer.fit(
+        epochs=100,
+        patience=15,
+    )
+
+    # ─── 10. (Optional) Save final model explicitly ───
+
+    # torch.save(model.state_dict(), "final_model_manual.pt")
+
 
 if __name__ == "__main__":
     main()
