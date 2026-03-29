@@ -390,7 +390,7 @@ def main():
     lstm_hidden_dim = 128
     lstm_layers = 2
     mlp_hidden_dim = 64
-    dropout = 0.2
+    dropout = 0.4
     n_fixture_features = 5
 
     # Training
