@@ -25,7 +25,6 @@ class FeatureType(Enum):
     ORDINAL = "ordinal"                   # ordered categories
     CATEGORICAL = "categorical"           # nominal categories
     PERIODIC = "periodic"                 # periodic numeric
-    IDENTITY = "identity"                 # leave untouched
 
 class ScalingMode(Enum):
     LINEAR = 'linear'
@@ -55,14 +54,6 @@ class DataSource(Enum):
     FIXINGESTER = "fixture_ingester"
     PRIOR = "prior"
     SEQUENCER = "sequencer"
-    SCALER = "scaler"
-
-EXTERNAL_DATA_SOURCES = frozenset({
-    DataSource.VAASTAV,
-    DataSource.FCI,
-    DataSource.OPTA,
-    DataSource.FIXTURE,
-})
 
 
 class FeatureSpec:
@@ -220,16 +211,6 @@ class FeatureSpec:
         """Set of all data sources (external and derived) for this feature."""
         return set(self.source.keys())
 
-    @property
-    def is_sequencer(self) -> bool:
-        """True if this feature is stamped by the sequencer, not loaded from CSV."""
-        return DataSource.SEQUENCER in self.source
-
-    @property
-    def is_derived(self) -> bool:
-        """True if this feature is computed internally rather than loaded from CSV."""
-        return not self.providers.issubset(EXTERNAL_DATA_SOURCES)
-
 
 class Features:
     """
@@ -294,22 +275,6 @@ class Features:
     def output_columns(self) -> list[str]:
         """Ordered list of all feature names; defines tensor column order for scaling and model input."""
         return [s.name for s in self.specs]
-
-    @cached_property
-    def pre_sequencer_columns(self) -> list[str]:
-        """Feature names present before sequencer stamping, excluding SEQUENCER-sourced features."""
-        return [
-            s.name for s in self.specs
-            if not s.is_sequencer
-        ]
-
-    @cached_property
-    def sequencer_columns(self) -> list[str]:
-        """Feature names stamped by the sequencer at sequence-build time; not loaded from CSV."""
-        return [
-            s.name for s in self.specs
-            if s.is_sequencer
-        ]
 
     @cached_property
     def numeric_columns(self) -> list[str]:
@@ -418,18 +383,6 @@ class Features:
         """
         return self._columns_for(self.output_columns, providers)
 
-    def categorical_columns_for(self, providers: list[DataSource]) -> list[str]:
-        """
-        Categorical output column names supplied by a given provider.
-
-        Args:
-            provider: DataSource to filter by.
-
-        Returns:
-            Categorical column names available for that provider.
-        """
-        return self._columns_for(self.categorical_columns, providers)
-
     def cumulative_columns_for(self, providers: list[DataSource]) -> list[str]:
         """
         Cumulative output column names supplied by a given provider.
@@ -479,14 +432,6 @@ class Features:
             s.name: s.cum_col
             for s in self.specs
             if s.cum_col is not None
-        }
-
-    @property
-    def inv_cumulative_map(self) -> dict[str, str]:
-        """Dict mapping cumulative column name to output column name (inverse of cumulative_map)."""
-        return {
-            cum: out
-            for out, cum in self.cumulative_map.items()
         }
 
     def cumulative_map_for(self, providers: DataSource | list[DataSource]) -> dict[str, str]:
@@ -544,8 +489,7 @@ class Features:
 
     #================================================
     # Spec Lookups
-    # Access individual specs by name, index, or grouped
-    # by mode or provider.
+    # Access individual specs by name or grouped by mode.
     #================================================
 
     def __getitem__(self, name: str) -> FeatureSpec:
@@ -570,40 +514,6 @@ class Features:
         """Return True if a feature with the given name exists in this collection."""
         return name in self._spec_by_name
 
-    def index_of(self, name: str) -> int:
-        """
-        Return the tensor column index of a named feature.
-
-        Args:
-            name: Feature name to look up.
-
-        Returns:
-            Integer index of the feature in the output tensor.
-
-        Raises:
-            KeyError: If no feature with that name exists.
-        """
-        for i, s in enumerate(self.specs):
-            if s.name == name:
-                return i
-        raise KeyError(f"No feature named '{name}'")
-
-    def index_from(self, index: int) -> str:
-        """
-        Return name of feature at index.
-
-        Args:
-            index: requested index
-
-        Returns: 
-            string name of feature at index
-
-        Raises:
-            KeyError: if no feature of index
-        """
-
-        return self.specs[index].name
-        
     @property
     def specs_by_mode(
         self,
@@ -613,15 +523,6 @@ class Features:
         for s in self.specs:
             key = (s.scaling_mode, s.position_group)
             result.setdefault(key, []).append(s)
-        return result
-
-    @property
-    def specs_by_provider(self) -> dict[DataSource, list[FeatureSpec]]:
-        """Group specs by provider; a multi-provider feature appears under each."""
-        result: dict[DataSource, list[FeatureSpec]] = {}
-        for s in self.specs:
-            for provider in s.source:
-                result.setdefault(provider, []).append(s)
         return result
 
     #================================================
