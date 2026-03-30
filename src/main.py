@@ -1,6 +1,7 @@
 import logging
 import math
 import pathlib
+import random 
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -16,7 +17,6 @@ from fpl_bot import (
     build_features24,
     build_features25,
     player_team_index,
-    Features,
     FeatureScaler,
     Trainer,
     FPLPointsPredictor,
@@ -28,7 +28,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -- Paths -------------------------------------------------------------------
+# -- SEED ---------------------------------------------
+SEED = 42
+random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+# -- Paths ---------------------------------------------
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _DATA_ROOT = _PROJECT_ROOT / "Data"
 
@@ -37,41 +43,12 @@ DATA_ROOT_25 = _DATA_ROOT / "2025-2026"
 
 # -- Position mapping ---------------------------------------------------------
 # Player metadata uses full names; the sequencer and priors expect short codes.
-_POSITION_SHORT = {
-    "Goalkeeper": "GKP",
-    "Defender": "DEF",
-    "Midfielder": "MID",
-    "Forward": "FWD",
+_POSITION_TO_NUM = {
+    "Goalkeeper": 1,
+    "Defender": 2,
+    "Midfielder": 3,
+    "Forward": 4,
 }
-
-
-def _build_player_meta(
-    players: pd.DataFrame,
-    features: Features,
-) -> pd.DataFrame:
-    """
-    Build player metadata DataFrame with position_idx derived from registry.
-
-    Args:
-        players: Raw players DataFrame with position already mapped to short codes.
-        features: Feature registry used to derive position encoding.
-
-    Returns:
-        DataFrame indexed by player_team_id with player_code, player_id,
-        team_code, position, and position_idx columns.
-    """
-    meta = players[["player_code", "player_id", "team_code", "position"]].copy()
-
-    pos_categories = features["position"].categories
-    pos_to_idx = {cat: i + 1 for i, cat in enumerate(pos_categories)}
-    meta["position"] = meta["position"].map(pos_to_idx)
-
-    return (
-        meta
-        .assign(player_team_id=player_team_index)
-        .set_index("player_team_id")
-    )
-
 
 # =============================================================================
 # Season setup
@@ -117,12 +94,6 @@ def _setup_season_24() -> tuple[str, pd.DataFrame, pd.DataFrame, FPLSourceConfig
 
     team_codes_df = teams[["code"]].rename(columns={"code": "team_code"})
 
-    # -- Player metadata ------------------------------------------------------
-    # OPTA base has position; map to short codes for the sequencer.
-    player_meta = opta_base[
-        ["player_code", "player_id", "team_code", "position"]
-    ].copy()
-
     # -- Source configs -------------------------------------------------------
     fpl_cfg = FPLSourceConfig(
         provider=DataSource.VAASTAV,
@@ -161,7 +132,7 @@ def _setup_season_24() -> tuple[str, pd.DataFrame, pd.DataFrame, FPLSourceConfig
         gw_filename="matches.csv",
     )
 
-    return season_root, player_meta, team_codes_df, fpl_cfg, opta_cfg, fixture_cfg
+    return season_root, team_codes_df, fpl_cfg, opta_cfg, fixture_cfg
 
 
 def _setup_season_25() -> tuple[str, pd.DataFrame, pd.DataFrame, FPLSourceConfig, FPLSourceConfig, FixtureSourceConfig]:
@@ -195,10 +166,14 @@ def _setup_season_25() -> tuple[str, pd.DataFrame, pd.DataFrame, FPLSourceConfig
     team_codes_df = teams[["code"]].rename(columns={"code": "team_code"})
 
     # -- Player metadata ------------------------------------------------------
+
     player_meta = players[
         ["player_code", "player_id", "team_code", "position"]
     ].copy()
-    player_meta["position"] = player_meta["position"].map(_POSITION_SHORT)
+    player_meta["position"] = player_meta["position"].map(_POSITION_TO_NUM)
+
+    player_meta["player_team_id"] = player_team_index(player_meta)   # shared util
+    player_meta = player_meta.set_index("player_team_id")
 
     # -- Source configs -------------------------------------------------------
     fpl_cfg = FPLSourceConfig(
@@ -277,19 +252,15 @@ def main():
     # ─── 1. Set up Seasons ───
     # ─── 1(a). 25/26 ───
 
-    season_root, players, teams, fpl_cfg, opta_cfg, fixture_cfg = _setup_season_25()
+    season_root, player_meta, teams, fpl_cfg, opta_cfg, fixture_cfg = _setup_season_25()
     features25 = build_features25(list(teams["team_code"]))
-
-    player_meta = _build_player_meta(players, features25)
     
     # ─── 1(b). 24/25 ───
     
     # we inherit player_meta from 25/26 as we only need those players priors anyway
 
-    prior_season_root, defunc_players, prior_teams, prior_fpl_cfg, prior_opta_cfg, prior_fixture_cfg = _setup_season_24()
+    prior_season_root, prior_teams, prior_fpl_cfg, prior_opta_cfg, prior_fixture_cfg = _setup_season_24()
     features24 = build_features24(list(prior_teams["team_code"]))
-
-    features24._spec_by_name["position"].categories = [1, 2, 3, 4]
 
     # ─── 2. Get Priors ───
 
@@ -314,21 +285,29 @@ def main():
         opta_config=opta_cfg,
         fixture_config=fixture_cfg,
         player_meta=player_meta,
-        prior_data=priors
+        prior_data=priors, 
+        window_size=8,
+        predict_window_size=1,
     )
 
     seq.ingest_range(1, 30)
 
     # ─── 4. Create train/val datasets with temporal split ───
-    # GW 2-24 for training, GW 25-29 for validation
-    # (GW 1 has no history, GW 30 is the last ingested target)
+    # via random player split
 
-    train_ds = seq.dataset(gw_start=2, gw_end=23) 
-    val_ds = seq.dataset(gw_start=24, gw_end=29)
+    all_players = list(seq._player_meta.keys())
+    rng = random.Random(SEED)
+    rng.shuffle(all_players)
     
+    split = int(0.8 * len(all_players))
+    train_players = all_players[:split]
+    val_players   = all_players[split:]
 
-    print(f"Train samples: {len(train_ds)}")  # n_players * 23
-    print(f"Val samples:   {len(val_ds)}")    # n_players * 5
+    train_ds = seq.dataset(gw_start=2, gw_end=25, player_codes=train_players) 
+    val_ds = seq.dataset(gw_start=2, gw_end=25, player_codes=val_players)
+    
+    print(f"Train samples: {len(train_ds)}") 
+    print(f"Val samples:   {len(val_ds)}")    
 
     # ─── 5. Create DataLoaders ───
 
@@ -360,46 +339,48 @@ def main():
 
     # ─── 5(d). Scale targets ───
     # Use the same ROBUST params fitted for the "points" input feature.
-    points_median, points_iqr = features25["points"].scaling_params
+    points_median, points_iqr = scaler.get_params("points")
     train_ds.scale_targets(points_median, points_iqr)
     val_ds.scale_targets(points_median, points_iqr)
 
-    # ─── 5(e). Create DataLoaders ───
+    # ─── 5(e). Scale fixture features ───
+    # ELO features in x_future_fixtures use the same params as the LSTM input.
+    train_ds.scale_fixtures(scaler)
+    val_ds.scale_fixtures(scaler)
+
+    # ─── 5(f). Create DataLoaders ───
     # Created AFTER scaling so persistent workers see the cached data.
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         pin_memory=True,
-        num_workers=2,
-        persistent_workers=True,
+
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
         pin_memory=True,
-        num_workers=2,
-        persistent_workers=True,
+
     )
 
     # ─── 7(a). Build model ───
     # All model and training parameters live here for easy grid search.
 
     # Model architecture
-    lstm_hidden_dim = 128
-    lstm_layers = 2
+    lstm_hidden_dim = 64
+    lstm_layers = 1
     mlp_hidden_dim = 64
-    dropout = 0.4
+    dropout = 0.1
     n_fixture_features = 5
 
     # Training
-
     learning_rate = 5e-4
-    weight_decay = 1e-4
+    weight_decay = 1e-5
     grad_clip = 1.0
     epochs = 100
-    patience = 15
+    patience = 8
 
     # ─── 7(b). Build model ───
 
@@ -434,7 +415,7 @@ def main():
     history = trainer.fit(
         epochs=epochs,
         patience=patience,
-        run_version="tuned_LTSM_MLP",
+        run_version="1_64_LTSM_MLP_huber_loss",
     )
 
     # ─── 10. (Optional) Save final model explicitly ───

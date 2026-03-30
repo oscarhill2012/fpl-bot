@@ -789,7 +789,7 @@ def _build_common_specs(
         accumulation=AccumulationType.NONE,
         temporal=False,
         source={DataSource.SEQUENCER: "position"},
-        categories=["GKP", "DEF", "MID", "FWD"],
+        categories=[1, 2, 3, 4],
         embedding_dim=4,
     ),
     FeatureSpec(

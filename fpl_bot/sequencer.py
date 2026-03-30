@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
-from .features import Features, FeatureSpec, FeatureType, DataSource
+from .features import Features, FeatureSpec, FeatureType, DataSource, ScalingMode
 from .ingester import Ingester, FPLSourceConfig, FixtureSourceConfig
 from .player_team_index import player_team_index
 from .priors import PriorData
@@ -107,7 +107,7 @@ class SeasonSequencer:
         self._player_meta: dict[str, dict[str, int]] = self.player_meta.to_dict(orient="index")
 
         # nothing ingested yet
-        self._current_gameweek: int = 0
+        self.current_gameweek: int = 0
         self._prior_data = prior_data
 
         # first gameweek a player plays minutes > 0, until then we use ingest_range
@@ -126,7 +126,7 @@ class SeasonSequencer:
 
         # cache minutes lookup
         self._minutes_lookup_cache: dict[int, dict[float, float]] = {}
-        self._build_minutes_lookup_cache
+        self._build_minutes_lookup_cache()
 
     #================================================
     # Initialise Helpers
@@ -165,7 +165,6 @@ class SeasonSequencer:
     
         return self
 
-    @property
     def _build_minutes_lookup_cache(self) -> "SeasonSequencer":
         """Populate cache for minutes lookup, from deterministic model."""
         # NOTE: at this stage this model is very crude...
@@ -201,7 +200,7 @@ class SeasonSequencer:
     @property
     def current_gw(self) -> int:
         """The latest ingested gameweek number."""
-        return self._current_gameweek
+        return self.current_gameweek
 
     def dataset(
         self,
@@ -222,7 +221,8 @@ class SeasonSequencer:
             FPLDataset wrapping this sequencer.
         """
         if gw_end is None:
-            gw_end = self._current_gameweek - self._target_window_size
+            gw_end = self.current_gameweek - self._target_window_size
+
         return FPLDataset(self, gw_start, gw_end, player_codes)
 
     #================================================
@@ -253,7 +253,7 @@ class SeasonSequencer:
 
         self._first_gw = self._ingester.first_gw
 
-        self._current_gameweek = gw_end
+        self.current_gameweek = gw_end
 
         # add new data to gw_cache
         for gw in range(gw_start, gw_end+1):
@@ -303,16 +303,16 @@ class SeasonSequencer:
         # restore priceless players so the ingester picks them up
         self._restore_priceless_players()
 
-        self._current_gameweek += 1
+        self.current_gameweek += 1
 
-        self._ingester.append_gw(self._current_gameweek)
-        self._ingester.update_future_fixtures(self._current_gameweek)
+        self._ingester.append_gw(self.current_gameweek)
+        self._ingester.update_future_fixtures(self.current_gameweek)
         self._first_gw = self._ingester.first_gw
 
-        self._cache_gw(self._current_gameweek)
+        self._cache_gw(self.current_gameweek)
 
         # backfill or re-remove priceless players
-        self._backfill_zero_prices(self._current_gameweek, self._current_gameweek)
+        self._backfill_zero_prices(self.current_gameweek, self.current_gameweek)
 
         return self
 
@@ -448,7 +448,7 @@ class SeasonSequencer:
         if target_gw <= 0 or (target_gw + self._target_window_size - 1) > 38:
             raise ValueError("Target window must lie within GW1-38")
         if not inference:
-            if (target_gw + self._target_window_size) > self._current_gameweek:
+            if (target_gw + self._target_window_size - 1) > self.current_gameweek:
                 raise ValueError("Target window contains un-ingested GW, set inference = True, or ingest.")
                 
         # static categorical codes, constant across timesteps
@@ -484,20 +484,15 @@ class SeasonSequencer:
 
         x_numeric = full[:, self.features.numeric_indices].astype(np.float32).round(3)
         x_categorical = full[:, self.features.categorical_indices].astype(np.int64)
-        x_future_fixtures = np.array(future_fixtures, dtype=np.int64)
+        x_future_fixtures = np.array(future_fixtures, dtype=np.float32)
 
         y_predict = np.array(target_data, dtype=np.float32)
 
         return {
-            "player_team_id": player_team_id,
             "x_numeric": x_numeric, 
             "x_categorical": x_categorical, 
             "x_future_fixtures": x_future_fixtures,
-            "input_window_length": self._window_size,
             "y": y_predict,
-            "target_gw": target_gw,
-            "target_window_length": self._target_window_size,
-
         }
 
     #================================================
@@ -647,14 +642,15 @@ class FPLDataset(Dataset):
         self, 
         sequencer: SeasonSequencer, 
         gw_start: int, 
-        gw_end: int, 
-        player_team_id: list[str] | None = None,
+        gw_end: int | None = None,
+        player_team_codes: list[str] | None = None,
         inference: bool = False
     ):
         self.sequencer = sequencer
         self._inference = inference 
 
         # --- validate gameweek range ---
+
         if gw_start < 1:
             raise ValueError(f"gw_start must be >= 1, got {gw_start}.")
         if gw_end < gw_start:
@@ -676,14 +672,14 @@ class FPLDataset(Dataset):
 
         # --- determine player set ---
 
-        if player_team_id is not None:
+        if player_team_codes is not None:
             known = set(sequencer._player_meta.keys())
-            unknown = set(player_team_id) - known
+            unknown = set(player_team_codes) - known
             if unknown:
                 raise ValueError(
                     f"Unknown player codes: {unknown}"
                 )
-            players = list(player_team_id)
+            players = list(player_team_codes)
         else:
             players = list(sequencer._player_meta.keys())
 
@@ -725,7 +721,7 @@ class FPLDataset(Dataset):
             Dictionary with keys:
                 x_numeric: float32 tensor, shape [T, F_cont].
                 x_categorical: long tensor, shape [T, C].
-                x_future_fixtures: long tensor, shape [K, fix_features].
+                x_future_fixtures: float32 tensor, shape [K, fix_features].
                 y: float32 tensor, shape [target_window_size].
         """
         if self._cache is not None:
@@ -747,7 +743,7 @@ class FPLDataset(Dataset):
                 sample["x_categorical"], dtype=torch.long,
             ),
             "x_future_fixtures": torch.tensor(
-                sample["x_future_fixtures"], dtype=torch.long,
+                sample["x_future_fixtures"], dtype=torch.float32,
             ),
             "y": torch.tensor(
                 sample["y"], dtype=torch.float32,
@@ -786,7 +782,7 @@ class FPLDataset(Dataset):
                     sample["x_categorical"], dtype=torch.long,
                 ),
                 "x_future_fixtures": torch.tensor(
-                    sample["x_future_fixtures"], dtype=torch.long,
+                    sample["x_future_fixtures"], dtype=torch.float32,
                 ),
                 "y": torch.tensor(
                     sample["y"], dtype=torch.float32,
@@ -808,11 +804,12 @@ class FPLDataset(Dataset):
         """
         if self._cache is None:
             raise RuntimeError("Call cache() before stacked_numeric().")
+
         return torch.stack([s["x_numeric"] for s in self._cache])
 
     def apply_scaled(self, scaled_numeric: torch.Tensor) -> None:
         """
-        Write pre-scaled numeric features back into the sample cache.
+        Write scaled numeric features back into the sample cache.
 
         Args:
             scaled_numeric: Tensor of shape [N_samples, T, F_numeric],
@@ -878,6 +875,71 @@ class FPLDataset(Dataset):
         logger.info(
             "Scaled %d target vectors (median=%.2f, iqr=%.2f).",
             len(self._cache), median, iqr,
+        )
+
+    def scale_fixtures(self, scaler: "FeatureScaler") -> None:
+        """
+        Scale cached fixture features using fitted scaler parameters.
+
+        Applies the same standardisation used for the LSTM input to the
+        fixture features in ``x_future_fixtures``, ensuring consistent
+        scale between the encoder context vector and the decoder fixture
+        input.
+
+        Only scales snapshot features (accumulation=NONE) with a
+        non-IDENTITY, non-CATEGORICAL scaling mode.  Accumulated
+        features (e.g. num_matches) are excluded because the fixture
+        tensor holds per-gameweek values while the scaler was fitted
+        on cumulative values.
+
+        Must be called after ``cache()``.
+
+        Args:
+            scaler: A fitted FeatureScaler whose ``get_params`` will
+                be used to retrieve scaling parameters for each
+                eligible fixture feature.
+
+        Raises:
+            RuntimeError: If called before cache().
+        """
+        if self._cache is None:
+            raise RuntimeError("Call cache() before scale_fixtures().")
+
+        features = self.sequencer.features
+        fixture_columns = features.output_columns_for(
+            [DataSource.FIXTURE, DataSource.FIXINGESTER],
+        )
+
+        # Identify columns eligible for scaling and retrieve their params.
+        # Only snapshot features share the same distribution between the
+        # LSTM input and the fixture tensor.
+        scale_specs: list[tuple[int, float, float]] = []
+        for i, col_name in enumerate(fixture_columns):
+            spec = features[col_name]
+            if not spec.is_snapshot:
+                continue
+            if spec.scaling_mode == ScalingMode.IDENTITY:
+                continue
+            if spec.feature_type == FeatureType.CATEGORICAL:
+                continue
+
+            p1, p2 = scaler.get_params(col_name)
+            scale_specs.append((i, p1, p2))
+
+        if not scale_specs:
+            logger.info("No fixture features eligible for scaling.")
+            return
+
+        for sample in self._cache:
+            fix = sample["x_future_fixtures"]
+            for col_idx, p1, p2 in scale_specs:
+                fix[:, col_idx] = (fix[:, col_idx] - p1) / p2
+
+        logger.info(
+            "Scaled %d fixture feature(s) across %d cached samples: %s",
+            len(scale_specs),
+            len(self._cache),
+            [fixture_columns[idx] for idx, _, _ in scale_specs],
         )
 
     #================================================

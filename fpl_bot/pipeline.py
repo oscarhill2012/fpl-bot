@@ -582,20 +582,6 @@ class FeatureScaler:
     # init Helpers
     #================================================
 
-    def _validate_input(self, x: torch.Tensor):
-        """Validate that the input tensor has the correct shape, type, and contains only finite values."""
-        if not isinstance(x, torch.Tensor):
-            raise TypeError('Input must be a tensor')
-        if not torch.is_floating_point(x):
-            raise TypeError(f'Input must be type float, received {x.dtype}')
-        if x.dim() != 3:
-            raise ValueError(f'Expected shape [Batch, Time, numeric_Features], received {x.shape}')
-        if not x.shape[-1] == len(self.features):
-            # masks generated internally, so check features give correct shape
-            raise RuntimeError('Tensor[Features] dimensions do not match len(features.specs)')
-        if not torch.isfinite(x).all().item():
-            raise ValueError('Input tensor contains NaN or infinite value(s).')
-
     def _bound_values_for(
         self,
         mode: ScalingMode,
@@ -694,6 +680,7 @@ class FeatureScaler:
             Tuple of (scaled tensor, features dict with fitted scaling params).
         """
         self._validate_input(x)
+        self._validate_position_ids(position_ids)
         x = x.clone().to(self.device)
         position_ids = position_ids.clone().to(self.device)
         presence_mask = self._build_presence_mask(x).to(self.device)
@@ -801,10 +788,46 @@ class FeatureScaler:
 
         return x_flat.view(p, g, f)
 
+    def get_params(self, feature: str) -> list[float, float]:
+        """
+        Gets scaling parameters for feature.
+
+        Args:
+            feature: name of FeatureSpec instance
+
+        Returns: list [location/min_value, scale/max_value]
+        """
+
+        for spec in self.features.specs:
+            if spec == self.features._spec_by_name[feature]:
+                return spec.scaling_params
+        
+        raise ValueError(f"{feature} does not exist in Features instance provided to scaler")
+        
     #================================================
     # Private Helpers
     #================================================
 
+    def _validate_input(self, x: torch.Tensor):
+        """Validate that the input tensor has the correct shape, type, and contains only finite values."""
+        if not isinstance(x, torch.Tensor):
+            raise TypeError('Input must be a tensor')
+        if not torch.is_floating_point(x):
+            raise TypeError(f'Input must be type float, received {x.dtype}')
+        if x.dim() != 3:
+            raise ValueError(f'Expected shape [Batch, Time, numeric_Features], received {x.shape}')
+        if not x.shape[-1] == len(self.features):
+            # masks generated internally, so check features give correct shape
+            raise RuntimeError('Tensor[Features] dimensions do not match len(features.specs)')
+        if not torch.isfinite(x).all().item():
+            raise ValueError('Input tensor contains NaN or infinite value(s).')
+
+    def _validate_position_ids(self, position_ids: torch.Tensor | None):
+        """Validate position_idx if required"""
+        has_pos_group = any(pg is not None for _, pg in self.scaling_masks.keys())
+        if has_pos_group and position_ids is None:
+            raise ValueError("position_ids is required when features with position group exist")
+        
     def _append_params(
         self,
         key: tuple[ScalingMode, PositionGroup | None],

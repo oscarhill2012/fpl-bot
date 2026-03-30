@@ -96,12 +96,12 @@ class Trainer:
         self.grad_clip = grad_clip
         self.target_iqr = target_iqr
 
-        self.criterion = nn.MSELoss()
-        self.optimiser = torch.optim.Adam(
+        self.criterion = nn.SmoothL1Loss()
+        self.optimiser = torch.optim.AdamW(
             model.parameters(), lr=lr, weight_decay=weight_decay,
         )
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimiser, mode="min", factor=0.5, patience=5,
+            self.optimiser, mode="min", factor=0.5, patience=5, min_lr=1e-8
         )
 
         param_count = sum(p.numel() for p in model.parameters())
@@ -135,7 +135,6 @@ class Trainer:
             TrainHistory with per-epoch metrics.
         """
         output_dir = self._resolve_output_dir(run_version)
-        history = TrainHistory()
         best_val_loss = float("inf")
         epochs_without_improvement = 0
 
@@ -307,7 +306,7 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         total_grad_norm = 0.0
-        n_batches = 0
+        n_samples = 0
         
         for batch in self.train_loader:
             x_numeric = batch["x_numeric"].to(self.device)
@@ -315,7 +314,7 @@ class Trainer:
             x_fix = batch["x_future_fixtures"].to(self.device)
             y = batch["y"].to(self.device)
 
-            pred = self.model(x_numeric, x_cat, x_fix)
+            pred: torch.Tensor = self.model(x_numeric, x_cat, x_fix)
             loss = self.criterion(pred, y)
 
             self.optimiser.zero_grad()
@@ -325,11 +324,13 @@ class Trainer:
             )
             self.optimiser.step()
 
-            total_grad_norm += float(grad_norm)
-            total_loss += loss.item()
-            n_batches += 1
+            batch_n = pred.shape[0]
+            n_samples += batch_n
 
-        return total_loss / n_batches, total_grad_norm / n_batches
+            total_grad_norm += float(grad_norm)
+            total_loss += loss.item() * batch_n
+        
+        return total_loss / n_samples, total_grad_norm / n_samples
 
     def _validate(
         self,
@@ -338,11 +339,11 @@ class Trainer:
         self.model.eval()
         total_loss = 0.0
         total_mae = 0.0
-        n_batches = 0
         total_abs_error_by_horizon = None
         pred_sum = 0.0
         pred_sq_sum = 0.0
         pred_count = 0
+        n_predictions = 0
 
         with torch.no_grad():
             for batch in self.val_loader:
@@ -351,7 +352,7 @@ class Trainer:
                 x_fix = batch["x_future_fixtures"].to(self.device)
                 y = batch["y"].to(self.device)
 
-                pred = self.model(x_numeric, x_cat, x_fix)
+                pred: torch.Tensor = self.model(x_numeric, x_cat, x_fix)
 
                 abs_err = torch.abs(pred - y)
                 horizon_abs = abs_err.sum(dim=0)
@@ -360,16 +361,17 @@ class Trainer:
                 else:
                     total_abs_error_by_horizon += horizon_abs
 
-                pred_sum += pred.sum()
-                pred_sq_sum += (pred ** 2).sum()
-                pred_count += pred.numel()
-                total_loss += self.criterion(pred, y)
-                total_mae += abs_err.mean()
-                n_batches += 1
+                # accumulate sums weighted by number of predictions
+                n_elements = pred.numel()
+                pred_sum += pred.sum().item()
+                pred_sq_sum += (pred ** 2).sum().item()
+                pred_count += n_elements
+                total_loss += self.criterion(pred, y).item() * n_elements
+                total_mae += abs_err.sum().item()
+                n_predictions += n_elements
 
-        # Sync to CPU once at epoch end rather than per-batch
-        mean_loss = total_loss.item() / n_batches
-        mean_mae = total_mae.item() / n_batches
+            mean_loss = total_loss / n_predictions
+            mean_mae = total_mae / n_predictions
 
         # Convert to real FPL points: scaled_mae * IQR
         iqr = self.target_iqr if self.target_iqr is not None else 1.0
@@ -381,9 +383,9 @@ class Trainer:
             * iqr
         ).tolist()
 
-        pred_mean = pred_sum.item() / pred_count
+        pred_mean = pred_sum/ pred_count
         pred_var = max(
-            (pred_sq_sum.item() / pred_count) - pred_mean ** 2, 0.0,
+            (pred_sq_sum / pred_count) - pred_mean ** 2, 0.0,
         )
         pred_std = pred_var ** 0.5
 
@@ -422,7 +424,7 @@ class Trainer:
         ax.plot(epochs, history.train_loss, label="train")
         ax.plot(epochs, history.val_loss, label="val")
         ax.axhline(best_val_loss, linestyle="--", alpha=0.7)
-        ax.set_ylim(0, 10)
+        ax.set_ylim(0, 1)
         ax.set_title("Loss")
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -444,7 +446,7 @@ class Trainer:
         ax = axes[1, 1]
         gap = [v - t for t, v in zip(history.train_loss, history.val_loss)]
         ax.plot(epochs, gap)
-        ax.set_ylim(-10, 10)
+        ax.set_ylim(-5, 5)
         ax.set_title("Generalisation Gap")
         ax.grid(True, alpha=0.3)
 
