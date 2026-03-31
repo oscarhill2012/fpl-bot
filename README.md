@@ -10,9 +10,11 @@ Data ingestion is fairly messy due to:
 Currently DEFCON calculation from last season off by ~5% due to inconsitencies between FPL and Opta stats.
 Currently investigating DEFCON also being wrong for this season due do inaccuracies in FPL-Core-Insight data.
 
-Model currently works predicting points for one week. Will look to predict a target window, points in a range of future gameweeks.
+Priors aims to ease cold start limitations of FPL datasets, it's only real purpose is to provide some early season context for an agent to generate a first team from...
 
-The model is fairly basic and currently tuned to perform optimally, but probably held back by data limitations, predicts points on validatioon group with mae ~ 1 point.
+There is the option to run a single head (SH) or multihead (MH) predictions. Multihead forces the model to predict features which contribute to points, it is currently very weak though, probably due to loss evalution still being calculated on points, not the individual feature predictions. Im guessing model just hacks out the same points prediction with the simplelest weight, I will look to fix this.
+
+Singlehead, just predicting points for given week, gets MAE ~ 1 point. Prediction is okay, the distribution is fine. Definitely limited by vast amount of 0 points and then the odd big haul 8+ points that seem to come from nowhere. Model does seem to do a reasonable job below 6 points though.
 
 I have also currently maxed out my limited deep learning knowledge, so will do some research into improving the model.
 

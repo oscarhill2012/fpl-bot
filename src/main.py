@@ -18,8 +18,10 @@ from fpl_bot import (
     build_features25,
     player_team_index,
     FeatureScaler,
-    Trainer,
-    FPLPointsPredictor,
+    TrainerMH,
+    FPLPointsPredictorMH,
+    TrainerSH,
+    FPLPointsPredictorSH,
 )
 
 logging.basicConfig(
@@ -369,8 +371,8 @@ def main():
     # All model and training parameters live here for easy grid search.
 
     # Model architecture
-    lstm_hidden_dim = 64
-    lstm_layers = 1
+    lstm_hidden_dim = 128
+    lstm_layers = 2
     mlp_hidden_dim = 64
     dropout = 0.1
     n_fixture_features = 5
@@ -384,7 +386,7 @@ def main():
 
     # ─── 7(b). Build model ───
 
-    model = FPLPointsPredictor.from_features(
+    model = FPLPointsPredictorMH.from_features(
         features25,
         n_fixture_features=n_fixture_features,
         lstm_hidden_dim=lstm_hidden_dim,
@@ -400,7 +402,7 @@ def main():
 
     # ─── 8. Initialise Trainer ───
 
-    trainer = Trainer(
+    trainer = TrainerMH(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,

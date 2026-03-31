@@ -6,18 +6,26 @@ import torch
 import torch.nn as nn
 
 from .features import Features
+from .scoring import ModelOutput, ScoringRules
 
 logger = logging.getLogger(__name__)
 
 
-class FPLPointsPredictor(nn.Module):
+class FPLPointsPredictorMH(nn.Module):
     """
-    LSTM encoder + MLP decoder for FPL points prediction.
+    LSTM encoder + multi-head MLP decoder for FPL points prediction.
 
-    Consumes the three tensors produced by ``FPLDataset``: scaled
-    numeric features, categorical integer indices, and future fixture
-    context.  Returns predicted points for each gameweek in the
-    predict window.
+    The encoder compresses the gameweek sequence into a context vector
+    (unchanged from the single-head baseline).  The decoder fans out
+    into two heads — a 3-class minutes-bracket classifier and a
+    6-component regression head — whose outputs are recombined by a
+    frozen ``ScoringRules`` layer using the official FPL scoring matrix.
+
+    Because the scoring rules layer is fully differentiable, the loss
+    is computed on total predicted points (identical to the baseline),
+    and gradients flow back through the scoring matrix to train each
+    component head.  At inference time the component predictions are
+    available for interpretability.
 
     Args:
         n_numeric_features: Number of scaled numeric input features.
@@ -29,18 +37,11 @@ class FPLPointsPredictor(nn.Module):
             ``categorical_vocab_sizes``.
         n_fixture_features: Features per target gameweek in
             ``x_future_fixtures`` (team_elo, oppo_team_elo, is_home,
-            num_matches, team_code = 5).  Note: team_code also
-            appears as an embedded categorical input; it is present
-            in the fixture cache because the ingester indexes by
-            team_code with ``drop=False``.
-        lstm_hidden_dim: LSTM hidden state size.  Controls the
-            capacity of the context vector.
-        lstm_layers: Number of stacked LSTM layers.  More layers
-            allow more abstract temporal patterns but increase
-            overfitting risk on small datasets.
-        mlp_hidden_dim: Width of the MLP decoder's hidden layers.
-        dropout: Dropout probability for LSTM (between layers) and
-            MLP (between hidden layers).
+            num_matches, team_code = 5).
+        lstm_hidden_dim: LSTM hidden state size.
+        lstm_layers: Number of stacked LSTM layers.
+        mlp_hidden_dim: Width of the shared decoder trunk.
+        dropout: Dropout probability for LSTM and MLP layers.
     """
 
     def __init__(
@@ -107,21 +108,39 @@ class FPLPointsPredictor(nn.Module):
         self.context_norm = nn.LayerNorm(lstm_hidden_dim)
 
         #=====================================================
-        # MLP Decoder
-        # Combines context vector with fixture difficulty to
-        # predict points. Applied per target gameweek.
+        # Multi-Head Decoder
+        # Shared trunk extracts a hidden representation from the
+        # context vector + fixture features.  Two heads project
+        # into scoring components:
+        #   - minutes_head: 3-class logits (no play / partial / full)
+        #   - regression_head: 6 scoring events (goals, assists,
+        #     CS, GC, saves, bonus)
         #=====================================================
 
         decoder_input_dim = lstm_hidden_dim + n_fixture_features
-        self.decoder = nn.Sequential(
+        self.decoder_trunk = nn.Sequential(
             nn.Linear(decoder_input_dim, mlp_hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden_dim, mlp_hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(mlp_hidden_dim // 2, 1),
         )
+
+        self.minutes_head = nn.Linear(
+            mlp_hidden_dim // 2, ScoringRules.N_MINUTES_CLASSES,
+        )
+        self.regression_head = nn.Linear(
+            mlp_hidden_dim // 2, ScoringRules.N_COMPONENTS,
+        )
+
+        #=====================================================
+        # Scoring Rules (frozen)
+        # Differentiable but non-learnable layer that applies the
+        # FPL scoring matrix to component predictions.
+        #=====================================================
+
+        self.scoring_rules = ScoringRules()
 
         self._initialise_weights()
 
@@ -129,10 +148,12 @@ class FPLPointsPredictor(nn.Module):
         param_count = sum(p.numel() for p in self.parameters())
         logger.info(
             "FPLPointsPredictor: LSTM(%d -> %d, %d layers) "
-            "+ MLP(%d -> %d -> %d -> 1), %d params",
+            "+ trunk(%d -> %d -> %d) "
+            "+ heads(minutes=%d, regression=%d), %d params",
             lstm_input_dim, lstm_hidden_dim, lstm_layers,
-            decoder_input_dim, mlp_hidden_dim,
-            mlp_hidden_dim // 2, param_count,
+            decoder_input_dim, mlp_hidden_dim, mlp_hidden_dim // 2,
+            ScoringRules.N_MINUTES_CLASSES, ScoringRules.N_COMPONENTS,
+            param_count,
         )
 
     #=====================================================
@@ -149,7 +170,7 @@ class FPLPointsPredictor(nn.Module):
         lstm_layers: int = 2,
         mlp_hidden_dim: int = 64,
         dropout: float = 0.2,
-    ) -> FPLPointsPredictor:
+    ) -> FPLPointsPredictorMH:
         """
         Construct the model from a Features registry.
 
@@ -226,9 +247,11 @@ class FPLPointsPredictor(nn.Module):
         x_numeric: torch.Tensor,
         x_categorical: torch.Tensor,
         x_future_fixtures: torch.Tensor,
-    ) -> torch.Tensor:
+        position_id: torch.Tensor,
+    ) -> ModelOutput:
         """
-        Run the full encoder-decoder forward pass.
+        Run the full encoder → multi-head decoder → scoring rules
+        forward pass.
 
         Args:
             x_numeric: Scaled numeric features.
@@ -236,12 +259,15 @@ class FPLPointsPredictor(nn.Module):
             x_categorical: Integer category indices.
                 Shape ``[B, T, C]``.
             x_future_fixtures: Fixture context for target gameweeks.
-                Shape ``[B, K, fix_feat]``.  Cast to float internally
-                (the dataset provides these as ``torch.long``).
+                Shape ``[B, K, fix_feat]``.
+            position_id: Raw FPL position ID per player
+                (1 = GK, 2 = DEF, 3 = MID, 4 = FWD).
+                Shape ``[B]``.
 
         Returns:
-            Predicted points.  Shape ``[B, K]`` where K is the number
-            of target gameweeks in the predict window.
+            ModelOutput containing predicted points ``[B, K]``,
+            minutes class probabilities ``[B, K, 3]``, and
+            activated component predictions ``[B, K, 6]``.
         """
         batch_size = x_numeric.shape[0]
         predict_window = x_future_fixtures.shape[1]
@@ -269,10 +295,10 @@ class FPLPointsPredictor(nn.Module):
         # normalise to stabilise scale before the MLP.
         context = self.context_norm(h_n[-1])  # [B, H]
 
-        # --- Decode: predict points per target gameweek ---
-        # The MLP head is shared across all K target GWs (parameter
-        # sharing).  Expand the context to pair with each fixture row,
-        # then batch all K predictions in one pass.
+        # --- Decode: predict components per target gameweek ---
+        # The trunk and heads are shared across all K target GWs
+        # (parameter sharing).  Expand the context to pair with each
+        # fixture row, then batch all K predictions in one pass.
         fixtures = x_future_fixtures.float()  # [B, K, fix]
 
         context_expanded = context.unsqueeze(1).expand(
@@ -283,14 +309,41 @@ class FPLPointsPredictor(nn.Module):
             [context_expanded, fixtures], dim=-1,
         )  # [B, K, H + fix]
 
-        # Flatten K into the batch dimension for a single MLP pass,
-        # then reshape back to [B, K].
+        # Flatten K into the batch dimension for a single trunk pass.
         flat = mlp_input.reshape(
             batch_size * predict_window, -1,
         )  # [B*K, H + fix]
-        predictions = self.decoder(flat)  # [B*K, 1]
 
-        return predictions.reshape(batch_size, predict_window)
+        trunk_out = self.decoder_trunk(flat)         # [B*K, hidden//2]
+        minutes_logits = self.minutes_head(trunk_out) # [B*K, 3]
+        regression_raw = self.regression_head(trunk_out)  # [B*K, 6]
+
+        # Reshape back to [B, K, ...].
+        minutes_logits = minutes_logits.reshape(
+            batch_size, predict_window, ScoringRules.N_MINUTES_CLASSES,
+        )
+        regression_raw = regression_raw.reshape(
+            batch_size, predict_window, ScoringRules.N_COMPONENTS,
+        )
+
+        # --- Activate component predictions ---
+        # Softmax for minutes (class probabilities), sigmoid for
+        # clean sheets (bounded 0-1), ReLU for counts (non-negative).
+        minutes_probs = torch.softmax(minutes_logits, dim=-1)
+        components = ScoringRules.activate_components(regression_raw)
+
+        # --- Apply scoring rules ---
+        # Differentiable combination using the FPL scoring matrix.
+        # Gradients flow back through this layer to each head.
+        points = self.scoring_rules(
+            minutes_probs, components, position_id,
+        )
+
+        return ModelOutput(
+            points=points,
+            minutes_probs=minutes_probs,
+            components=components,
+        )
 
     #=====================================================
     # Inference Helpers
@@ -303,9 +356,10 @@ class FPLPointsPredictor(nn.Module):
         x_numeric: torch.Tensor,
         x_categorical: torch.Tensor,
         x_future_fixtures: torch.Tensor,
-    ) -> torch.Tensor:
+        position_id: torch.Tensor,
+    ) -> ModelOutput:
         """
-        Predict points with gradients disabled.
+        Predict points and components with gradients disabled.
 
         Sets the model to evaluation mode (disabling dropout), runs
         the forward pass without gradient tracking, then restores the
@@ -315,18 +369,22 @@ class FPLPointsPredictor(nn.Module):
             x_numeric: Scaled numeric features, ``[B, T, F]``.
             x_categorical: Category indices, ``[B, T, C]``.
             x_future_fixtures: Fixture context, ``[B, K, fix]``.
+            position_id: FPL position IDs, ``[B]``.
 
         Returns:
-            Predicted points, ``[B, K]``.
+            ModelOutput with points ``[B, K]``, minutes class
+            probabilities ``[B, K, 3]``, and component predictions
+            ``[B, K, 6]``.
         """
         was_training = self.training
         self.eval()
-        predictions = self(
-            x_numeric, x_categorical, x_future_fixtures,
+        output = self(
+            x_numeric, x_categorical,
+            x_future_fixtures, position_id,
         )
         if was_training:
             self.train()
-        return predictions
+        return output
 
     #=====================================================
     # Private Helpers
@@ -342,7 +400,11 @@ class FPLPointsPredictor(nn.Module):
             elif "bias" in name:
                 nn.init.zeros_(param)
 
-        for module in self.decoder:
+        for module in (
+            *self.decoder_trunk.modules(),
+            self.minutes_head,
+            self.regression_head,
+        ):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)

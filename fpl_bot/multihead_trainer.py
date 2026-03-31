@@ -13,7 +13,8 @@ import json
 from tqdm.auto import tqdm
 import shutil
 
-from .model import FPLPointsPredictor
+from .multihead_model import FPLPointsPredictorMH
+from .scoring import ScoringRules
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TrainHistory:
+class TrainHistoryMH:
     """
     Container for per-epoch training metrics.
 
@@ -53,7 +54,7 @@ class TrainHistory:
 # ============================================================================
 
 
-class Trainer:
+class TrainerMH:
     """
     Manages training and validation of an FPLPointsPredictor.
 
@@ -80,7 +81,7 @@ class Trainer:
 
     def __init__(
         self,
-        model: FPLPointsPredictor,
+        model: FPLPointsPredictorMH,
         train_loader: DataLoader,
         val_loader: DataLoader,
         lr: float = 1e-3,
@@ -125,7 +126,7 @@ class Trainer:
         epochs: int,
         patience: int = 10,
         run_version: str = "default",
-    ) -> TrainHistory:
+    ) -> TrainHistoryMH:
         """
         Run the full training loop with early stopping.
 
@@ -150,7 +151,7 @@ class Trainer:
         )
 
         shutil.rmtree(output_dir / "tensorboard", ignore_errors=True)
-        history = TrainHistory()
+        history = TrainHistoryMH()
         writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
         epoch_bar = tqdm(range(epochs), desc="Training", unit="epoch")
 
@@ -170,7 +171,6 @@ class Trainer:
             history.val_mae.append(val_mae)
             history.val_mae_points.append(val_mae_points)
             history.lr.append(current_lr)
-
             history.grad_norm.append(grad_norm)
             history.pred_mean.append(pred_mean)
             history.pred_std.append(pred_std)
@@ -190,7 +190,6 @@ class Trainer:
             writer.add_scalar("MAE/val", val_mae, epoch)
             writer.add_scalar("MAE/val_points", val_mae_points, epoch)
             writer.add_scalar("LR", current_lr, epoch)
-
             writer.add_scalar("Train/grad_norm", grad_norm, epoch)
             writer.add_scalar("Pred/mean", pred_mean, epoch)
             writer.add_scalar("Pred/std", pred_std, epoch)
@@ -319,8 +318,10 @@ class Trainer:
             x_cat = batch["x_categorical"].to(self.device)
             x_fix = batch["x_future_fixtures"].to(self.device)
             y = batch["y"].to(self.device)
+            position_id = batch["position_id"].to(self.device)
 
-            pred: torch.Tensor = self.model(x_numeric, x_cat, x_fix)
+            output = self.model(x_numeric, x_cat, x_fix, position_id)
+            pred: torch.Tensor = output.points
             loss = self.criterion(pred, y)
 
             self.optimiser.zero_grad()
@@ -357,8 +358,10 @@ class Trainer:
                 x_cat = batch["x_categorical"].to(self.device)
                 x_fix = batch["x_future_fixtures"].to(self.device)
                 y = batch["y"].to(self.device)
+                position_id = batch["position_id"].to(self.device)
 
-                pred: torch.Tensor = self.model(x_numeric, x_cat, x_fix)
+                output = self.model(x_numeric, x_cat, x_fix, position_id)
+                pred: torch.Tensor = output.points
 
                 abs_err = torch.abs(pred - y)
                 horizon_abs = abs_err.sum(dim=0)
@@ -366,7 +369,6 @@ class Trainer:
                     total_abs_error_by_horizon = horizon_abs.clone()
                 else:
                     total_abs_error_by_horizon += horizon_abs
-
                 # accumulate sums weighted by number of predictions
                 n_elements = pred.numel()
                 pred_sum += pred.sum().item()
@@ -410,7 +412,7 @@ class Trainer:
         return path
 
 
-    def _save_history_json(self, path: pathlib.Path, history: TrainHistory) -> None:
+    def _save_history_json(self, path: pathlib.Path, history: TrainHistoryMH) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(history.__dict__, f, indent=2)
@@ -419,7 +421,7 @@ class Trainer:
     def _save_training_summary_plot(
         self,
         run_dir: pathlib.Path,
-        history: TrainHistory,
+        history: TrainHistoryMH,
         best_val_loss: float,
     ) -> None:
         epochs = range(1, len(history.train_loss) + 1)
@@ -470,16 +472,21 @@ class Trainer:
             fig.savefig(run_dir / "final_horizon_mae.png", dpi=200)
             plt.close(fig)
 
-    def _collect_predictions(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Collect all validation predictions and targets in scaled space.
+    def _collect_predictions(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Collect all validation predictions, targets, and component breakdowns.
 
         Returns:
-            Tuple of (predictions, targets), each with shape [N, K]
-            where N is total samples and K is the prediction horizon.
+            Tuple of (points, targets, breakdown) where points and
+            targets have shape ``[N, K]`` and breakdown is a dict
+            from ``ScoringRules.decompose`` with tensors concatenated
+            across the full validation set.
         """
         self.model.eval()
-        all_preds = []
+        all_points = []
         all_targets = []
+        all_breakdowns: dict[str, list[torch.Tensor]] = {}
 
         with torch.no_grad():
             for batch in self.val_loader:
@@ -487,12 +494,24 @@ class Trainer:
                 x_cat = batch["x_categorical"].to(self.device)
                 x_fix = batch["x_future_fixtures"].to(self.device)
                 y = batch["y"].to(self.device)
+                pos_id = batch["position_id"].to(self.device)
 
-                pred = self.model(x_numeric, x_cat, x_fix)
-                all_preds.append(pred.cpu())
+                output = self.model(x_numeric, x_cat, x_fix, pos_id)
+                all_points.append(output.points.cpu())
                 all_targets.append(y.cpu())
 
-        return torch.cat(all_preds), torch.cat(all_targets)
+                breakdown = ScoringRules.decompose(output)
+                for name, tensor in breakdown.items():
+                    all_breakdowns.setdefault(name, []).append(
+                        tensor.cpu(),
+                    )
+
+        merged_breakdown = {
+            name: torch.cat(tensors)
+            for name, tensors in all_breakdowns.items()
+        }
+
+        return torch.cat(all_points), torch.cat(all_targets), merged_breakdown
 
     def _unscale_points(self, scaled: torch.Tensor) -> torch.Tensor:
         """Convert scaled predictions back to real FPL points."""
@@ -504,7 +523,7 @@ class Trainer:
         self, run_dir: pathlib.Path,
     ) -> None:
         """Plot predicted vs actual distributions, one row per horizon GW."""
-        preds, targets = self._collect_predictions()
+        preds, targets, breakdown = self._collect_predictions()
         preds = self._unscale_points(preds)
         targets = self._unscale_points(targets)
         n_horizons = preds.shape[1]
@@ -556,4 +575,59 @@ class Trainer:
 
         fig.tight_layout()
         fig.savefig(run_dir / "prediction_distribution.png", dpi=200)
+        plt.close(fig)
+
+        self._save_component_distribution_plot(run_dir, breakdown, n_horizons)
+
+    def _save_component_distribution_plot(
+        self,
+        run_dir: pathlib.Path,
+        breakdown: dict[str, torch.Tensor],
+        n_horizons: int,
+    ) -> None:
+        """Plot distributions for each scoring component per horizon GW."""
+        component_names = ScoringRules.component_names()
+        minutes_labels = ["No play", "Sub (1-59')", "Full (60+')"]
+        bins = 50
+
+        # One row per horizon, one column per component + minutes
+        n_cols = len(component_names) + 1
+        fig, axes = plt.subplots(
+            n_horizons, n_cols,
+            figsize=(4 * n_cols, 4 * n_horizons),
+            squeeze=False,
+        )
+
+        for k in range(n_horizons):
+            # Scoring components (goals, assists, CS, GC, saves, bonus)
+            for col, name in enumerate(component_names):
+                ax = axes[k, col]
+                values = breakdown[name][:, k].numpy()
+                ax.hist(values, bins=bins, alpha=0.7)
+                ax.set_title(
+                    f"GW+{k + 1} — {name.replace('_', ' ').title()}",
+                )
+                ax.set_xlabel(name.replace("_", " "))
+                ax.set_ylabel("Count")
+                ax.grid(True, alpha=0.3)
+
+            # Minutes probabilities (stacked bar of class means)
+            ax = axes[k, -1]
+            minutes_probs = breakdown["minutes_probs"][:, k, :]
+            mean_probs = minutes_probs.mean(dim=0).numpy()
+            bars = ax.bar(minutes_labels, mean_probs, alpha=0.7)
+            for bar, prob in zip(bars, mean_probs):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.01,
+                    f"{prob:.2f}",
+                    ha="center", va="bottom", fontsize=9,
+                )
+            ax.set_title(f"GW+{k + 1} — Minutes Bracket")
+            ax.set_ylabel("Mean Probability")
+            ax.set_ylim(0, 1)
+            ax.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        fig.savefig(run_dir / "component_distributions.png", dpi=200)
         plt.close(fig)
