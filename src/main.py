@@ -409,13 +409,14 @@ def main():
         grad_clip=grad_clip,
         device=device,
         target_iqr=points_iqr,
+        target_median=points_median,
     )
 
     # ─── 9. Train ───
     history = trainer.fit(
         epochs=epochs,
         patience=patience,
-        run_version="1_64_LTSM_MLP_huber_loss",
+        run_version="testing",
     )
 
     # ─── 10. (Optional) Save final model explicitly ───

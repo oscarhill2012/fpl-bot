@@ -73,6 +73,9 @@ class Trainer:
         target_iqr: IQR of the target feature from ROBUST scaling.
             When set, validation MAE is converted back to real FPL
             points via ``scaled_mae * iqr``.
+        target_median: Median of the target feature from ROBUST scaling.
+            Used together with ``target_iqr`` to convert predictions
+            back to real FPL points via ``scaled * iqr + median``.
     """
 
     def __init__(
@@ -85,6 +88,7 @@ class Trainer:
         grad_clip: float = 1.0,
         device: torch.device | None = None,
         target_iqr: float | None = None,
+        target_median: float | None = None,
     ):
         """Initialise trainer with model, data, and hyperparameters."""
         self.device = device or torch.device(
@@ -95,6 +99,7 @@ class Trainer:
         self.val_loader = val_loader
         self.grad_clip = grad_clip
         self.target_iqr = target_iqr
+        self.target_median = target_median
 
         self.criterion = nn.SmoothL1Loss()
         self.optimiser = torch.optim.AdamW(
@@ -224,6 +229,7 @@ class Trainer:
 
         writer.close()
         self._save_training_summary_plot(output_dir, history, best_val_loss)
+        self._save_prediction_distribution_plot(output_dir)
         self._save_history_json(output_dir / "training_history.json", history)
 
         return history
@@ -463,3 +469,91 @@ class Trainer:
             ax.set_ylabel("MAE (FPL points)")
             fig.savefig(run_dir / "final_horizon_mae.png", dpi=200)
             plt.close(fig)
+
+    def _collect_predictions(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Collect all validation predictions and targets in scaled space.
+
+        Returns:
+            Tuple of (predictions, targets), each with shape [N, K]
+            where N is total samples and K is the prediction horizon.
+        """
+        self.model.eval()
+        all_preds = []
+        all_targets = []
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                x_numeric = batch["x_numeric"].to(self.device)
+                x_cat = batch["x_categorical"].to(self.device)
+                x_fix = batch["x_future_fixtures"].to(self.device)
+                y = batch["y"].to(self.device)
+
+                pred = self.model(x_numeric, x_cat, x_fix)
+                all_preds.append(pred.cpu())
+                all_targets.append(y.cpu())
+
+        return torch.cat(all_preds), torch.cat(all_targets)
+
+    def _unscale_points(self, scaled: torch.Tensor) -> torch.Tensor:
+        """Convert scaled predictions back to real FPL points."""
+        iqr = self.target_iqr if self.target_iqr is not None else 1.0
+        median = self.target_median if self.target_median is not None else 0.0
+        return scaled * iqr + median
+
+    def _save_prediction_distribution_plot(
+        self, run_dir: pathlib.Path,
+    ) -> None:
+        """Plot predicted vs actual distributions, one row per horizon GW."""
+        preds, targets = self._collect_predictions()
+        preds = self._unscale_points(preds)
+        targets = self._unscale_points(targets)
+        n_horizons = preds.shape[1]
+        bins = 50
+
+        fig, axes = plt.subplots(
+            n_horizons, 2, figsize=(14, 5 * n_horizons),
+            squeeze=False,
+        )
+
+        for k in range(n_horizons):
+            preds_k = preds[:, k].numpy()
+            targets_k = targets[:, k].numpy()
+
+            # Overlaid density histograms
+            ax = axes[k, 0]
+            ax.hist(
+                targets_k, bins=bins, alpha=0.5,
+                label="Actual", density=True,
+            )
+            ax.hist(
+                preds_k, bins=bins, alpha=0.5,
+                label="Predicted", density=True,
+            )
+            ax.set_title(f"GW+{k + 1} — Predicted vs Actual")
+            ax.set_xlabel("FPL Points")
+            ax.set_ylabel("Density")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            # Predicted-only with summary statistics
+            ax = axes[k, 1]
+            mean_val = preds_k.mean()
+            median_val = float(preds[:, k].median())
+            ax.hist(preds_k, bins=bins, alpha=0.7, color="tab:orange")
+            ax.axvline(
+                mean_val, color="red", linestyle="--",
+                label=f"Mean: {mean_val:.2f}",
+            )
+            ax.axvline(
+                median_val, color="blue", linestyle="--",
+                label=f"Median: {median_val:.2f}",
+            )
+            ax.set_title(f"GW+{k + 1} — Predicted Distribution")
+            ax.set_xlabel("FPL Points")
+            ax.set_ylabel("Count")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        fig.savefig(run_dir / "prediction_distribution.png", dpi=200)
+        plt.close(fig)
