@@ -90,7 +90,7 @@ class FixtureProvider:
 
         # derive_cols: any features to be derived in provider
         self._derived_cols = list(features.output_columns_for([DataSource.FIXINGESTER]))
-
+   
     #================================================
     # Public Functions
     #================================================
