@@ -37,7 +37,7 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
 # -- Paths ---------------------------------------------
-_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _DATA_ROOT = _PROJECT_ROOT / "Data"
 
 DATA_ROOT_24 = _DATA_ROOT / "2024-2025"

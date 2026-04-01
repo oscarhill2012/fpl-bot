@@ -16,7 +16,8 @@ There is the option to run a single head (SH) or multihead (MH) predictions. Mul
 
 Singlehead, just predicting points for given week, gets MAE ~ 1 point. Prediction is okay, the distribution is fine. Definitely limited by vast amount of 0 points and then the odd big haul 8+ points that seem to come from nowhere. Model does seem to do a reasonable job below 6 points though.
 
-I have also currently maxed out my limited deep learning knowledge, so will do some research into improving the model.
+Currently: - adding target loading, so can add loss functions for scoring features in multihead
+           - adding fixture prediction model, will add fixture context via a score predictor (this will be helpful when simulating data for RL as we want to be able to model team dynamics, i.e if we predict liverpool to get cs all liverpool defenders need cs points)
 
 Final Goal: - Implement a basic AI agent to use models predictions to play a season of fpl, via RL.
 
