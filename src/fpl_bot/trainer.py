@@ -13,7 +13,7 @@ import json
 from tqdm.auto import tqdm
 import shutil
 
-from .singlehead_model import FPLPointsPredictorSH
+from .model import FPLPointsPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TrainHistorySH:
+class TrainHistory:
     """
     Container for per-epoch training metrics.
 
@@ -53,7 +53,7 @@ class TrainHistorySH:
 # ============================================================================
 
 
-class TrainerSH:
+class Trainer:
     """
     Manages training and validation of an FPLPointsPredictor.
 
@@ -80,7 +80,7 @@ class TrainerSH:
 
     def __init__(
         self,
-        model: FPLPointsPredictorSH,
+        model: FPLPointsPredictor,
         train_loader: DataLoader,
         val_loader: DataLoader,
         lr: float = 1e-3,
@@ -125,7 +125,7 @@ class TrainerSH:
         epochs: int,
         patience: int = 10,
         run_version: str = "default",
-    ) -> TrainHistorySH:
+    ) -> TrainHistory:
         """
         Run the full training loop with early stopping.
 
@@ -150,7 +150,7 @@ class TrainerSH:
         )
 
         shutil.rmtree(output_dir / "tensorboard", ignore_errors=True)
-        history = TrainHistorySH()
+        history = TrainHistory()
         writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
         epoch_bar = tqdm(range(epochs), desc="Training", unit="epoch")
 
@@ -410,7 +410,7 @@ class TrainerSH:
         return path
 
 
-    def _save_history_json(self, path: pathlib.Path, history: TrainHistorySH) -> None:
+    def _save_history_json(self, path: pathlib.Path, history: TrainHistory) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(history.__dict__, f, indent=2)
@@ -419,7 +419,7 @@ class TrainerSH:
     def _save_training_summary_plot(
         self,
         run_dir: pathlib.Path,
-        history: TrainHistorySH,
+        history: TrainHistory,
         best_val_loss: float,
     ) -> None:
         epochs = range(1, len(history.train_loss) + 1)

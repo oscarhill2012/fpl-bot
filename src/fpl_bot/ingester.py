@@ -106,22 +106,12 @@ class FixtureProvider:
             DataFrame with fixture_columns from features
         """
         # rename columns so they end at team_code when processing
-        # fixtures provides fixture specific information
         raw_fixtures = (
             pd.read_csv(self.season_root + self.cfg.gw_path + f"GW{gw}/{self.cfg.gw_filename}")
             .rename(columns={"home_team": "home_team_code", "away_team": "away_team_code"})
         )
         raw_fixtures = _match_filter(raw_fixtures, self.cfg.other_games, self.cfg.denotes_epl, f"GW{gw}")
         
-        # strengths provides current (gw snapshot) team specific information
-        raw_strengths = (
-            pd.read_csv(self.season_root + self.cfg.gw_path + f"GW{gw}/teams.csv")
-            .rename(columns={"code": "team_code"})
-            .set_index("team_code")
-        )
-
-        gw_fixtures = self._append_strengths(gw_fixtures, raw_strengths)
-
         # dataset gives one row per game (teams are home and away)
         # we want one row per team, so we need to split and rename columns
         home_df, away_df = self._home_away_split(raw_fixtures)
@@ -145,6 +135,8 @@ class FixtureProvider:
             .filter(items=self.output_cols)         # select only output columns     
         )
 
+        gw_fixtures = self._flatten_dgw(gw_fixtures)
+
         self.features.validate_dataframe_from_source(
             gw_fixtures, self.output_cols, [self.cfg.provider], context=f"GW{gw}"
         )
@@ -155,33 +147,6 @@ class FixtureProvider:
     #================================================   
     # Private Helpers
     #================================================   
-
-    def _append_strengths(self, raw_fixtures: pd.DataFrame, raw_strengths: pd.DataFrame) -> pd.DataFrame:
-        """assign each teams strengths based on if they home or away"""
-        # Merge home team strengths
-        home_cols = {
-            'team_code': 'home_team_code',
-            'strength_home': 'home_strength_overall',
-            'strength_attack_home': 'home_strength_attack',
-            'strength_defence_home': 'home_strength_defence',
-        }
-        raw_fixtures = raw_fixtures.merge(
-            raw_strengths[list(home_cols.keys())].rename(columns=home_cols),
-            on='home_team_code', how='left'
-        )
-
-        # Merge away team strengths
-        away_cols = {
-            'team_code': 'away_team_code',
-            'strength_away': 'away_strength_overall',
-            'strength_attack_away': 'away_strength_attack',
-            'strength_defence_away': 'away_strength_defence',
-        }
-        raw_fixtures = raw_fixtures.merge(
-            raw_strengths[list(away_cols.keys())].rename(columns=away_cols),
-            on='away_team_code', how='left'
-        )
-        return raw_fixtures
 
     @staticmethod
     def _home_away_split(gw_fixtures: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -245,7 +210,22 @@ class FixtureProvider:
             .fillna(0)
         )
 
-            
+    def _flatten_dgw(self, gw_fixtures: pd.DataFrame) -> pd.DataFrame:
+        """Group by team_code and average for DGWs; sum-aggregated columns use sum instead."""
+        # columns that should be summed rather than averaged (e.g. num_matches: 1+1 = 2 in a DGW)
+        sum_cols = [c for c in self._derived_cols if c in gw_fixtures.columns]
+        avg_cols = [c for c in gw_fixtures.columns if c not in sum_cols and c != "team_code"]
+
+        grouped = gw_fixtures.groupby("team_code", as_index=False)
+        agg_map = {c: "mean" for c in avg_cols}
+        agg_map.update({c: "sum" for c in sum_cols})
+
+        gw_fixtures = (
+            grouped.agg(agg_map)
+            .set_index("team_code", drop=False)
+        )
+        return gw_fixtures
+
     #================================================
     # Feature Derivation Methods
     #================================================

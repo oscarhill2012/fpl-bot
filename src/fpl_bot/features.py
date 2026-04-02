@@ -79,6 +79,7 @@ class FeatureSpec:
         min_value: float = 0,
         scaling_params: list | None = None,
         position_group: PositionGroup | None = None,
+        target: bool = False,
     ):
         """
         Initialise a FeatureSpec.
@@ -104,6 +105,7 @@ class FeatureSpec:
             scaling_params: Fitted scaling parameters [p1, p2]; populated after scaling.
             position_group: If set, the scaler fits only on rows from this
                 position group. Transform still applies to all rows.
+            target: If True, this feature is used as a prediction target.
         """
         self.name = name
         self.feature_type = feature_type
@@ -118,6 +120,7 @@ class FeatureSpec:
         self.period = period
 
         self.position_group = position_group
+        self.target = target
         self.source = source if source is not None else {}
 
         # avoid mutable defaults
@@ -315,6 +318,10 @@ class Features:
     def raw_cumulative_columns(self) -> list[str]:
         """Feature names accumulated but not per-90 divided; typically 'minutes' and 'featured'."""
         return [s.name for s in self.specs if s.accumulation == AccumulationType.RAW_CUMULATIVE]
+
+    def get_targets(self) -> list[str]:
+        """Return names of features marked as prediction targets."""
+        return [s.name for s in self.specs if s.target]
 
     #================================================
     # Provide Filtered Instance
@@ -583,6 +590,7 @@ class Features:
                 "max_value": s.max_value,
                 "min_value": s.min_value,
                 "position_group": s.position_group.value if s.position_group else None,
+                "target": s.target,
             }
             for s in self.specs
         ]
@@ -638,6 +646,7 @@ class Features:
                     max_value=d["max_value"],
                     min_value=d["min_value"],
                     position_group=pos_group,
+                    target=d.get("target", False),
                 )
             )
         return cls(specs)

@@ -18,10 +18,8 @@ from fpl_bot import (
     build_features25,
     player_team_index,
     FeatureScaler,
-    TrainerMH,
-    FPLPointsPredictorMH,
-    TrainerSH,
-    FPLPointsPredictorSH,
+    Trainer,
+    FPLPointsPredictor,
 )
 
 logging.basicConfig(
@@ -386,7 +384,7 @@ def main():
 
     # ─── 7(b). Build model ───
 
-    model = FPLPointsPredictorMH.from_features(
+    model = FPLPointsPredictor.from_features(
         features25,
         n_fixture_features=n_fixture_features,
         lstm_hidden_dim=lstm_hidden_dim,
@@ -402,7 +400,7 @@ def main():
 
     # ─── 8. Initialise Trainer ───
 
-    trainer = TrainerMH(
+    trainer = Trainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,

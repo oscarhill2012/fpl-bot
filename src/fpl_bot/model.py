@@ -10,7 +10,7 @@ from .features import Features
 logger = logging.getLogger(__name__)
 
 
-class FPLPointsPredictorSH(nn.Module):
+class FPLPointsPredictor(nn.Module):
     """
     LSTM encoder + MLP decoder for FPL points prediction.
 
@@ -149,7 +149,7 @@ class FPLPointsPredictorSH(nn.Module):
         lstm_layers: int = 2,
         mlp_hidden_dim: int = 64,
         dropout: float = 0.2,
-    ) -> FPLPointsPredictorSH:
+    ) -> FPLPointsPredictor:
         """
         Construct the model from a Features registry.
 

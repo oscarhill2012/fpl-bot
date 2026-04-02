@@ -493,7 +493,6 @@ class SeasonSequencer:
             "x_categorical": x_categorical, 
             "x_future_fixtures": x_future_fixtures,
             "y": y_predict,
-            "position_id": position,
         }
 
     #================================================
@@ -749,9 +748,6 @@ class FPLDataset(Dataset):
             "y": torch.tensor(
                 sample["y"], dtype=torch.float32,
             ),
-            "position_id": torch.tensor(
-                sample["position_id"], dtype=torch.long
-            ),
         }
 
     #================================================
@@ -791,9 +787,6 @@ class FPLDataset(Dataset):
                 "y": torch.tensor(
                     sample["y"], dtype=torch.float32,
                 ),
-                "position_id": torch.tensor(
-                sample["position_id"], dtype=torch.long
-            ),
             })
 
         self._cache = raw_samples

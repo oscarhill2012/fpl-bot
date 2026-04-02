@@ -12,14 +12,15 @@ Currently investigating DEFCON also being wrong for this season due do inaccurac
 
 Priors aims to ease cold start limitations of FPL datasets, it's only real purpose is to provide some early season context for an agent to generate a first team from...
 
-There is the option to run a single head (SH) or multihead (MH) predictions. Multihead forces the model to predict features which contribute to points, it is currently very weak though, probably due to loss evalution still being calculated on points, not the individual feature predictions. Im guessing model just hacks out the same points prediction with the simplelest weight, I will look to fix this.
+Files that look to try and predict scoring metrics (goals, assists, ...) and then use FPL deterministic scoring rules exist with prefix "multihead". I investigated using these btu currently model just hacks predicting these metrics as is still only evaluated on points loss function. Will look to add loss function for predicting individual metrics. 
 
-Singlehead, just predicting points for given week, gets MAE ~ 1 point. Prediction is okay, the distribution is fine. Definitely limited by vast amount of 0 points and then the odd big haul 8+ points that seem to come from nowhere. Model does seem to do a reasonable job below 6 points though.
+Points prediction works fine with MAE ~ 1 point, predictions 0-6 points. As expected, unable to predict any 8+ point hauls.
 
-Currently: - adding target loading, so can add loss functions for scoring features in multihead
-           - adding fixture prediction model, will add fixture context via a score predictor (this will be helpful when simulating data for RL as we want to be able to model team dynamics, i.e if we predict liverpool to get cs all liverpool defenders need cs points)
+I was hoping to incorperate a fixture prediction model, i.e predict score and clean sheet percentage for each fixture from strengths and elos. This would have been a seperate model that would have been trained and frozen. I have put this on hold however since there is just not enough consistent data to train this.
 
-Final Goal: - Implement a basic AI agent to use models predictions to play a season of fpl, via RL.
+This would have been cruicial to trying to implement the model as a data simulator to train an RL agent, since the data simulation would need Liverpool get CS, all liverpool defenders get CS points. The massive inconsistencies between FPL-Core-Insights 24/25 and 25/26 data means there isnt really anything to train the fixture model on. This is a shame, as it means there isnt really a practical way to simulate match dependancy for players and since the data for FPL with DEFCON points is essentially limited to the current season, I don't see an easy way to solve the data scarcity.
+
+Due to this I am going to stop working on this bot, I may come back to try and improve points prediction by implementing loss functions for scoring features.  
 
 Data from:
         - https://github.com/olbauday/FPL-Core-Insights
